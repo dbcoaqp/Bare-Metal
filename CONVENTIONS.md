@@ -16,3 +16,9 @@ This project is a renderer engine designed for the analysis and visualization of
 ### Vulkan API Usage
 - **No Raw C API:** Do not use the raw C Vulkan API.
 - **Vulkan.hpp:** You must use the C++ bindings provided by `vulkan.hpp` for all Vulkan-related operations.
+
+### Safety Net
+- The `VK_LAYER_KHRONOS_validation` layer must be explicitly enabled. If the validation layer cannot be detected, the program must throw a `std::runtime_error` and crash hard; silent failure is strictly prohibited.
+
+### Build System
+- A modern `CMakeLists.txt` file must be generated alongside the project, automatically linking `glfw3` and `vulkan`.
