@@ -1,9 +1,9 @@
 #define VULKAN_HPP_DISPATCH_LOADER_DYNAMIC 1
 
-#define GLFW_INCLUDE_VULKAN
-#include <GLFW/glfw3.h>
-#include <vulkan/vulkan.hpp>
+#define VMA_IMPLEMENTATION
+#include "VmaUsage.h"
 
+#include <vulkan/vulkan.hpp>
 #include <iostream>
 #include <vector>
 #include <stdexcept>
@@ -11,6 +11,7 @@
 #include <map>
 #include <optional>
 
+// Global function pointer table memory allocation
 VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE;
 
 struct QueueFamilyIndices {
@@ -27,10 +28,9 @@ public:
     static TargetDevice selectOptimalDevice(const vk::Instance& instance) {
         std::vector<vk::PhysicalDevice> devices = instance.enumeratePhysicalDevices();
         if (devices.empty()) {
-            throw std::runtime_error("Fatal: No Vulkan supported GPU.\n ");
+            throw std::runtime_error("Fatal: No Vulkan supported GPU.");
         }
 
-        // Use multimap to automatically sort in ascending order based on the score.
         std::multimap<int, TargetDevice> candidates;
 
         for (const auto& device : devices) {
@@ -45,7 +45,6 @@ public:
                 "the underlying computing architecture for interception.");
         }
 
-        // rbegin() retrieves the device with the highest score.
         TargetDevice bestDevice = candidates.rbegin()->second;
 
         std::cout << "[System] Locked Target Device: "
@@ -60,7 +59,7 @@ private:
         QueueFamilyIndices indices{};
         vk::PhysicalDeviceProperties properties = device.getProperties();
 
-        // 1. Need to be a Discrete GPU
+        // 1. Needs to be a Discrete GPU
         if (properties.deviceType != vk::PhysicalDeviceType::eDiscreteGpu) {
             return {0, indices};
         }
@@ -74,7 +73,7 @@ private:
             }
         }
         if (!indices.computeFamily.has_value()) {
-            return {0, indices}; // Discard the cards without the calculation unit
+            return {0, indices};
         }
 
         // 3. Evaluate the VRAM, every 1MB counts as one point
@@ -96,11 +95,9 @@ private:
     }
 };
 
-// RAII wrapper for the Vulkan Logical Device and Compute Queue
 class VulkanDevice {
 public:
-    explicit VulkanDevice(const TargetDevice& target) {
-        // 1. Queue creation with priority 1.0f (compute task exclusive)
+    explicit VulkanDevice(const vk::Instance& instance, const TargetDevice& target) {
         float queuePriority = 1.0f;
         vk::DeviceQueueCreateInfo queueCreateInfo(
             vk::DeviceQueueCreateFlags(),
@@ -109,11 +106,9 @@ public:
             &queuePriority
         );
 
-        // 2. Activate Vulkan 1.3 core features: synchronization2
         vk::PhysicalDeviceVulkan13Features vulkan13Features{};
         vulkan13Features.synchronization2 = VK_TRUE;
 
-        // 3. Device creation with pNext chain
         vk::DeviceCreateInfo deviceCreateInfo(
             vk::DeviceCreateFlags(),
             1,
@@ -121,17 +116,48 @@ public:
         );
         deviceCreateInfo.pNext = &vulkan13Features;
 
-        // 4. Create unique device to manage lifecycle
         device = target.physical.createDeviceUnique(deviceCreateInfo);
 
-        // 5. Update dynamic dispatcher for device-level function pointers
+        // Extracting device-level function pointers
         VULKAN_HPP_DEFAULT_DISPATCHER.init(device.get());
 
-        // 6. Acquire compute queue handle
         computeQueue = device->getQueue(target.indices.computeFamily.value(), 0);
+
+        // Initialize VMA Allocator
+        VmaVulkanFunctions vulkanFunctions = {};
+        vulkanFunctions.vkGetInstanceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr;
+        vulkanFunctions.vkGetDeviceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr;
+        vulkanFunctions.vkGetPhysicalDeviceProperties = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceProperties;
+        vulkanFunctions.vkGetPhysicalDeviceMemoryProperties = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceMemoryProperties;
+        vulkanFunctions.vkAllocateMemory = VULKAN_HPP_DEFAULT_DISPATCHER.vkAllocateMemory;
+        vulkanFunctions.vkFreeMemory = VULKAN_HPP_DEFAULT_DISPATCHER.vkFreeMemory;
+        vulkanFunctions.vkMapMemory = VULKAN_HPP_DEFAULT_DISPATCHER.vkMapMemory;
+        vulkanFunctions.vkUnmapMemory = VULKAN_HPP_DEFAULT_DISPATCHER.vkUnmapMemory;
+        vulkanFunctions.vkBindBufferMemory = VULKAN_HPP_DEFAULT_DISPATCHER.vkBindBufferMemory;
+        vulkanFunctions.vkBindImageMemory = VULKAN_HPP_DEFAULT_DISPATCHER.vkBindImageMemory;
+        vulkanFunctions.vkGetBufferMemoryRequirements = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetBufferMemoryRequirements;
+        vulkanFunctions.vkGetImageMemoryRequirements = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetImageMemoryRequirements;
+        vulkanFunctions.vkCreateBuffer = VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateBuffer;
+        vulkanFunctions.vkDestroyBuffer = VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyBuffer;
+        vulkanFunctions.vkCreateImage = VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateImage;
+        vulkanFunctions.vkDestroyImage = VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyImage;
+        vulkanFunctions.vkCmdCopyBuffer = VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdCopyBuffer;
+
+        VmaAllocatorCreateInfo allocatorCreateInfo = {};
+        allocatorCreateInfo.vulkanApiVersion = VK_API_VERSION_1_3;
+        allocatorCreateInfo.instance = instance;
+        allocatorCreateInfo.physicalDevice = target.physical;
+        allocatorCreateInfo.device = device.get();
+        allocatorCreateInfo.pVulkanFunctions = &vulkanFunctions;
+
+        vmaCreateAllocator(&allocatorCreateInfo, &allocator);
     }
 
-    ~VulkanDevice() = default;
+    ~VulkanDevice() {
+        if (allocator != VK_NULL_HANDLE) {
+            vmaDestroyAllocator(allocator);
+        }
+    }
 
     vk::Queue getComputeQueue() const { return computeQueue; }
     vk::Device getDevice() const { return *device; }
@@ -139,21 +165,28 @@ public:
 private:
     vk::UniqueDevice device;
     vk::Queue computeQueue;
+    VmaAllocator allocator = VK_NULL_HANDLE;
 };
 
-// RAII wrapper for the Vulkan Instance
 class VulkanInstance {
 public:
     VulkanInstance() {
-        // 1. Application Info
-        vk::ApplicationInfo appInfo("VulkanRenderer", 1, "No Engine", 1, VK_API_VERSION_1_3);
+        // [Extremely Critical] Cold Start of Dynamic Loaders: Finding the Genesis Function vkGetInstanceProcAddr
+        PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr = 
+            dl.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr");
+        if (!vkGetInstanceProcAddr) {
+            throw std::runtime_error("Fatal: Unable to extract the Vulkan loader pointer from the system dynamic library.");
+        }
+        
+        // The dispatcher is initialized using the genesis function, obtaining the pointers necessary for creating the instance.
+        VULKAN_HPP_DEFAULT_DISPATCHER.init(vkGetInstanceProcAddr);
 
-        // 2. Validation Layers
+        vk::ApplicationInfo appInfo("Vulkan Compute Probe", 1, "Bare Metal", 1, VK_API_VERSION_1_3);
+
         const std::vector<const char*> validationLayers = {
             "VK_LAYER_KHRONOS_validation"
         };
 
-        // Check for validation layer support
         auto availableLayers = vk::enumerateInstanceLayerProperties();
         for (const char* layerName : validationLayers) {
             bool layerFound = false;
@@ -164,76 +197,43 @@ public:
                 }
             }
             if (!layerFound) {
-                throw std::runtime_error("Validation layer not found: " + std::string(layerName));
+                throw std::runtime_error(std::string("Fatal: Validation Layer Lost: ") + layerName);
             }
         }
 
-        // 3. Instance Creation
-        uint32_t glfwExtensionCount = 0;
-        const char** glfwExtensions = glfwGetRequiredInstanceExtensions(&glfwExtensionCount);
-        std::vector<const char*> extensions(glfwExtensions, glfwExtensions + glfwExtensionCount);
+        // Headless mode no longer requests any GLFW Surface extensions.
+        vk::InstanceCreateInfo createInfo({}, &appInfo, validationLayers, {});
 
-        vk::InstanceCreateInfo createInfo({}, &appInfo, validationLayers, extensions);
-
+        // Calling createInstanceUnique now is safe.
         instance = vk::createInstanceUnique(createInfo);
+
+        // Get the complete function pointer table at the instance level.
+        VULKAN_HPP_DEFAULT_DISPATCHER.init(instance.get());
     }
 
-    ~VulkanInstance() = default; // unique_ptr handles cleanup
+    ~VulkanInstance() = default;
 
     vk::Instance get() const { return *instance; }
 
 private:
+    vk::DynamicLoader dl; // The loader must be held as a member variable to ensure its lifetime.
     vk::UniqueInstance instance;
-};
-
-// RAII wrapper for GLFW Window
-class Window {
-public:
-    Window(int width, int height, const char* title) {
-        if (!glfwInit()) {
-            throw std::runtime_error("Failed to initialize GLFW");
-        }
-        glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-        window = glfwCreateWindow(width, height, title, nullptr, nullptr);
-        if (!window) {
-            glfwTerminate();
-            throw std::runtime_error("Failed to create GLFW window");
-        }
-    }
-
-    ~Window() {
-        glfwDestroyWindow(window);
-        glfwTerminate();
-    }
-
-    bool shouldClose() const { return glfwWindowShouldClose(window); }
-    void pollEvents() const { glfwPollEvents(); }
-
-private:
-    GLFWwindow* window;
 };
 
 int main() {
     try {
-        Window window(800, 600, "Vulkan Engine");
+        std::cout << "--- Bare Metal Boot Sequence Initiated ---" << std::endl;
+        
         VulkanInstance vkInstance;
+        std::cout << "[System] Vulkan Instance initialized (Dynamic Dispatch Active)." << std::endl;
 
-        // Initialize instance-level dynamic dispatcher
-        VULKAN_HPP_DEFAULT_DISPATCHER.init(vkInstance.get());
-
-        std::cout << "Vulkan initialized successfully with validation layers." << std::endl;
-
-        // Select optimal physical device with compute queue family index
         TargetDevice target = DeviceSelector::selectOptimalDevice(vkInstance.get());
 
-        // Create logical device and acquire compute queue
-        VulkanDevice vulkanDevice(target);
+        VulkanDevice vulkanDevice(vkInstance.get(), target);
+        std::cout << "[System] Logical Device and Compute Queue successfully engaged." << std::endl;
+        std::cout << "[System] VMA Allocator successfully engaged." << std::endl;
+        std::cout << "--- Bare Metal Boot Sequence Completed ---" << std::endl;
 
-        std::cout << "Logical Device and Compute Queue initialized." << std::endl;
-
-        while (!window.shouldClose()) {
-            window.pollEvents();
-        }
     } catch (const std::exception& e) {
         std::cerr << "Critical Error: " << e.what() << std::endl;
         return EXIT_FAILURE;
