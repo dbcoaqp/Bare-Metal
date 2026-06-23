@@ -1,0 +1,19 @@
+#version 460
+// declare using Vulkan 1.3
+#extension GL_KHR_vulkan_glsl : require
+
+// Define a workgroup containing 256 concurrent threads
+layout (local_size_x = 256) in;
+
+// Adheres to the std430 layout, aligned with the data structures in the C++ version
+layout(std430, set = 0, binding = 0) buffer DataBuffer {
+    float values[];
+};
+
+void main() {
+    // Get the global physical ID of the current thread in the entire scheduling grid.
+    uint index = gl_GlobalInvocationID.x;
+    
+    // Make the graphics card double every number in the array.
+    values[index] = values[index] * 2.0;
+}
