@@ -10,6 +10,11 @@
 #include <memory>
 #include <map>
 #include <optional>
+#include <cstring>
+
+#include "utils/FileIO.h"
+#include "utils/VkCheck.h"
+#include "core/VmaBuffer.h"
 
 // Global function pointer table memory allocation
 VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE;
@@ -145,33 +150,25 @@ public:
         vulkanFunctions.vkDestroyImage = VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyImage;
         vulkanFunctions.vkCmdCopyBuffer = VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdCopyBuffer;
 
-        // Fill in the advanced memory interface in Vulkan 1.1 and 1.3
-        // VMA will force the invocation of these 2KHR and 1.3-specific high-level functions.
-        // xtract the modern function pointers that have been promoted to Core (without the KHR suffix) from vulkan.hpp 
-        // and stuff them into the old-style KHR slots of VMA.
         vulkanFunctions.vkGetPhysicalDeviceMemoryProperties2KHR = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceMemoryProperties2;
         vulkanFunctions.vkGetBufferMemoryRequirements2KHR       = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetBufferMemoryRequirements2;
         vulkanFunctions.vkGetImageMemoryRequirements2KHR        = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetImageMemoryRequirements2;
         vulkanFunctions.vkBindBufferMemory2KHR                  = VULKAN_HPP_DEFAULT_DISPATCHER.vkBindBufferMemory2;
         vulkanFunctions.vkBindImageMemory2KHR                   = VULKAN_HPP_DEFAULT_DISPATCHER.vkBindImageMemory2;
         
-        // Vulkan 1.3 Core-specific memory functions
         vulkanFunctions.vkGetDeviceBufferMemoryRequirements     = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceBufferMemoryRequirements;
         vulkanFunctions.vkGetDeviceImageMemoryRequirements      = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceImageMemoryRequirements;
 
         VmaAllocatorCreateInfo allocatorCreateInfo = {};
         allocatorCreateInfo.vulkanApiVersion = VK_API_VERSION_1_3;
         
-        // Forcefully reduce a C++ object's static_cast to a raw C handle, eliminating compile-time risks.
         allocatorCreateInfo.instance = static_cast<VkInstance>(instance);
         allocatorCreateInfo.physicalDevice = static_cast<VkPhysicalDevice>(target.physical);
         allocatorCreateInfo.device = static_cast<VkDevice>(device.get());
         
         allocatorCreateInfo.pVulkanFunctions = &vulkanFunctions;
 
-        if (vmaCreateAllocator(&allocatorCreateInfo, &allocator) != VK_SUCCESS) {
-            throw std::runtime_error("Fatal: VMA Allocator Initialization failed.");
-        }
+        VK_CHECK(vmaCreateAllocator(&allocatorCreateInfo, &allocator));
     }
 
     ~VulkanDevice() {
@@ -182,6 +179,7 @@ public:
 
     vk::Queue getComputeQueue() const { return computeQueue; }
     vk::Device getDevice() const { return *device; }
+    VmaAllocator getAllocator() const { return allocator; }
 
 private:
     vk::UniqueDevice device;
@@ -198,7 +196,6 @@ public:
             throw std::runtime_error("Fatal: Unable to extract the Vulkan loader pointer from the system dynamic library.");
         }
         
-        // The dispatcher is initialized using the genesis function, obtaining the pointers necessary for creating the instance.
         VULKAN_HPP_DEFAULT_DISPATCHER.init(vkGetInstanceProcAddr);
 
         vk::ApplicationInfo appInfo("Vulkan Compute Probe", 1, "Bare Metal", 1, VK_API_VERSION_1_3);
@@ -221,13 +218,10 @@ public:
             }
         }
 
-        // Headless mode no longer requests any GLFW Surface extensions.
         vk::InstanceCreateInfo createInfo({}, &appInfo, validationLayers, {});
 
-        // Calling createInstanceUnique now is safe.
         instance = vk::createInstanceUnique(createInfo);
 
-        // Get the complete function pointer table at the instance level.
         VULKAN_HPP_DEFAULT_DISPATCHER.init(instance.get());
     }
 
@@ -236,7 +230,7 @@ public:
     vk::Instance get() const { return *instance; }
 
 private:
-    vk::detail::DynamicLoader dl; // The loader must be held as a member variable to ensure its lifetime.
+    vk::detail::DynamicLoader dl;
     vk::UniqueInstance instance;
 };
 
@@ -253,6 +247,29 @@ int main() {
         std::cout << "[System] Logical Device and Compute Queue successfully engaged." << std::endl;
         std::cout << "[System] VMA Allocator successfully engaged." << std::endl;
         std::cout << "--- Bare Metal Boot Sequence Completed ---" << std::endl;
+
+        // Read shader binary (path injected by CMake at build-time)
+        std::string shaderPath = std::string(SHADER_DIR) + "/probe.spv";
+        auto shaderCode = FileIO::readFile(shaderPath);
+        std::cout << "[System] Shader loaded: " << shaderCode.size() << " bytes." << std::endl;
+
+        // Create and test VMA Storage Buffer
+        VmaBuffer storageBuffer(
+            vulkanDevice.getAllocator(),
+            sizeof(float) * 256,
+            vk::BufferUsageFlagBits::eStorageBuffer,
+            VMA_MEMORY_USAGE_CPU_TO_GPU
+        );
+
+        // Map buffer and populate with data 0.0f to 255.0f
+        float* mappedData = static_cast<float*>(storageBuffer.map());
+        for (uint32_t i = 0; i < 256; ++i) {
+            mappedData[i] = static_cast<float>(i);
+        }
+        storageBuffer.flush();
+        storageBuffer.unmap();
+
+        std::cout << "[System] VMA Storage Buffer successfully mapped and populated." << std::endl;
 
     } catch (const std::exception& e) {
         std::cerr << "Critical Error: " << e.what() << std::endl;
