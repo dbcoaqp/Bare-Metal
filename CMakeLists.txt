@@ -18,16 +18,17 @@ FetchContent_MakeAvailable(VulkanMemoryAllocator)
 # Offline SPIR-V compilation (CONVENTIONS.md §2: Runtime compilation is BANNED)
 find_program(GLSLC glslc REQUIRED)
 
-file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/shaders)
+set(SHADER_SRC "${CMAKE_SOURCE_DIR}/shaders/probe.comp")
+set(SHADER_BIN "${CMAKE_SOURCE_DIR}/shaders/probe.spv")
 
 add_custom_command(
-    OUTPUT ${CMAKE_BINARY_DIR}/shaders/probe.spv
-    COMMAND ${GLSLC} ${CMAKE_SOURCE_DIR}/shaders/probe.comp -o ${CMAKE_BINARY_DIR}/shaders/probe.spv
-    DEPENDS ${CMAKE_SOURCE_DIR}/shaders/probe.comp
+    OUTPUT ${SHADER_BIN}
+    COMMAND ${GLSLC} ${SHADER_SRC} -o ${SHADER_BIN}
+    DEPENDS ${SHADER_SRC}
     COMMENT "Compiling compute shader: probe.comp -> probe.spv"
 )
 
-add_custom_target(Shaders ALL DEPENDS ${CMAKE_BINARY_DIR}/shaders/probe.spv)
+add_custom_target(CompileShaders ALL DEPENDS ${SHADER_BIN})
 
 include_directories(${Vulkan_INCLUDE_DIRS})
 include_directories(${CMAKE_SOURCE_DIR})
@@ -35,10 +36,10 @@ include_directories(${CMAKE_SOURCE_DIR}/utils)
 include_directories(${CMAKE_SOURCE_DIR}/core)
 
 add_executable(BareMetalComputeProbe main.cpp)
-add_dependencies(BareMetalComputeProbe Shaders)
+add_dependencies(BareMetalComputeProbe CompileShaders)
 
 target_compile_definitions(BareMetalComputeProbe PRIVATE 
     VULKAN_HPP_DISPATCH_LOADER_DYNAMIC=1
-    SHADER_DIR="${CMAKE_BINARY_DIR}/shaders"
+    SHADER_DIR="${CMAKE_SOURCE_DIR}/shaders"
 )
 target_link_libraries(BareMetalComputeProbe PRIVATE Vulkan::Vulkan VulkanMemoryAllocator)
