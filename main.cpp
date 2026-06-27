@@ -271,6 +271,165 @@ int main() {
 
         std::cout << "[System] VMA Storage Buffer successfully mapped and populated." << std::endl;
 
+        // 1. Create Shader Module (RAII)
+        vk::ShaderModuleCreateInfo shaderModuleCreateInfo(
+            vk::ShaderModuleCreateFlags(),
+            shaderCode.size(),
+            reinterpret_cast<const uint32_t*>(shaderCode.data())
+        );
+        auto shaderModule = vulkanDevice.getDevice().createShaderModuleUnique(shaderModuleCreateInfo);
+        std::cout << "[System] Compute Shader Module compiled." << std::endl;
+
+        // 2. Create Descriptor Set Layout & Pool (Contract & Pool)
+        vk::DescriptorSetLayoutBinding layoutBinding(
+            0,                                // binding
+            vk::DescriptorType::eStorageBuffer,
+            1,                                // descriptorCount
+            vk::ShaderStageFlagBits::eCompute
+        );
+
+        vk::DescriptorSetLayoutCreateInfo layoutCreateInfo(
+            vk::DescriptorSetLayoutCreateFlags(),
+            1,                                // bindingCount
+            &layoutBinding
+        );
+
+        auto descriptorSetLayout = vulkanDevice.getDevice().createDescriptorSetLayoutUnique(layoutCreateInfo);
+
+        vk::DescriptorPoolSize poolSize(
+            vk::DescriptorType::eStorageBuffer,
+            1                                 // descriptorCount
+        );
+
+        vk::DescriptorPoolCreateInfo poolCreateInfo(
+            vk::DescriptorPoolCreateFlags(),
+            1,                                // maxSets
+            1,                                // poolSizeCount
+            &poolSize
+        );
+
+        auto descriptorPool = vulkanDevice.getDevice().createDescriptorPoolUnique(poolCreateInfo);
+
+        // 3. Forge Compute Pipeline (State Machine)
+        vk::PipelineLayoutCreateInfo pipelineLayoutCreateInfo(
+            vk::PipelineLayoutCreateFlags(),
+            1,                                // setLayoutCount
+            &*descriptorSetLayout
+        );
+
+        auto pipelineLayout = vulkanDevice.getDevice().createPipelineLayoutUnique(pipelineLayoutCreateInfo);
+
+        vk::PipelineShaderStageCreateInfo stageCreateInfo(
+            vk::PipelineShaderStageCreateFlags(),
+            vk::ShaderStageFlagBits::eCompute,
+            *shaderModule,
+            "main"
+        );
+
+        vk::ComputePipelineCreateInfo computePipelineCreateInfo(
+            vk::PipelineCreateFlags(),
+            stageCreateInfo,
+            *pipelineLayout
+        );
+
+        auto computePipelineResult = vulkanDevice.getDevice().createComputePipelineUnique(
+            nullptr,                          // pipelineCache
+            computePipelineCreateInfo
+        );
+
+        if (computePipelineResult.result != vk::Result::eSuccess) {
+            throw std::runtime_error("Fatal: Failed to create compute pipeline.");
+        }
+
+        auto computePipeline = std::move(computePipelineResult.value);
+
+        // 4. Update Descriptor Set (Bind Contract)
+        vk::DescriptorSetAllocateInfo descriptorSetAllocateInfo(
+            *descriptorPool,
+            1,                                // descriptorSetCount
+            &*descriptorSetLayout
+        );
+
+        auto descriptorSets = vulkanDevice.getDevice().allocateDescriptorSets(descriptorSetAllocateInfo);
+        auto descriptorSet = descriptorSets[0];
+
+        vk::DescriptorBufferInfo bufferInfo(
+            storageBuffer.getBuffer(),
+            0,                                // offset
+            VK_WHOLE_SIZE
+        );
+
+        vk::WriteDescriptorSet writeDescriptorSet(
+            descriptorSet,
+            0,                                // dstBinding
+            0,                                // dstArrayElement
+            1,                                // descriptorCount
+            vk::DescriptorType::eStorageBuffer,
+            nullptr,                          // pImageInfo
+            &bufferInfo,
+            nullptr                           // pTexelBufferView
+        );
+
+        vulkanDevice.getDevice().updateDescriptorSets(
+            1,                                // descriptorWriteCount
+            &writeDescriptorSet,
+            0,                                // descriptorCopyCount
+            nullptr                           // pDescriptorCopies
+        );
+
+        // 5. Record and Dispatch (Command & Fire)
+        vk::CommandPoolCreateInfo commandPoolCreateInfo(
+            vk::CommandPoolCreateFlags(),
+            target.indices.computeFamily.value()
+        );
+
+        auto commandPool = vulkanDevice.getDevice().createCommandPoolUnique(commandPoolCreateInfo);
+
+        vk::CommandBufferAllocateInfo commandBufferAllocateInfo(
+            *commandPool,
+            vk::CommandBufferLevel::ePrimary,
+            1                                 // commandBufferCount
+        );
+
+        auto commandBuffers = vulkanDevice.getDevice().allocateCommandBuffersUnique(commandBufferAllocateInfo);
+        auto commandBuffer = std::move(commandBuffers[0]);
+
+        vk::CommandBufferBeginInfo beginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
+        commandBuffer->begin(beginInfo);
+        commandBuffer->bindPipeline(vk::PipelineBindPoint::eCompute, *computePipeline);
+        commandBuffer->bindDescriptorSets(
+            vk::PipelineBindPoint::eCompute,
+            *pipelineLayout,
+            0,                                // firstSet
+            1,                                // descriptorSetCount
+            &descriptorSet,
+            0,                                // dynamicOffsetCount
+            nullptr                           // pDynamicOffsets
+        );
+        commandBuffer->dispatch(1, 1, 1);     // 1 workgroup = 256 threads (local_size_x=256)
+        commandBuffer->end();
+
+        vk::SubmitInfo submitInfo(
+            0,                                // waitSemaphoreCount
+            nullptr,                          // pWaitSemaphores
+            nullptr,                          // pWaitDstStageMask
+            1,                                // commandBufferCount
+            &*commandBuffer
+        );
+
+        VK_CHECK(vulkanDevice.getComputeQueue().submit(1, &submitInfo, nullptr));
+        vulkanDevice.getComputeQueue().waitIdle();
+
+        // 6. Verification (Battle Check)
+        float* verificationData = static_cast<float*>(storageBuffer.map());
+        
+        if (verificationData[1] != 2.0f || verificationData[255] != 510.0f) {
+            throw std::runtime_error("Fatal: GPU computation verification failed!");
+        }
+        
+        storageBuffer.unmap();
+        std::cout << "[System] IGNITION SUCCESS: GPU Compute Pipeline executed perfectly. All 256 threads returned mathematically correct results." << std::endl;
+
     } catch (const std::exception& e) {
         std::cerr << "Critical Error: " << e.what() << std::endl;
         return EXIT_FAILURE;
