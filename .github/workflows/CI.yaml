@@ -16,13 +16,18 @@ jobs:
     - name: 1. Checkout core code
       uses: actions/checkout@v4
       
-    - name: 2. Set Execution Policy
+    - name: 2. Build and Test
       shell: cmd
       run: |
-        "C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat" -arch=amd64 && powershell -NoExit
-        echo "Hello!"
-        cmake -B build -DCMAKE_BUILD_TYPE=Debug
-        cmake --build build --config Debug --verbose
-        .\build\Debug\BareMetalComputeProbe.exe
+        call "C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat" -arch=amd64
+
+        where cl
+        where cmake
+    
+
+        
+    
+        echo "=== RUNNING TEST ==="
+        .\build\Debug\BareMetalComputeProbe.exe || exit /b 1  
 
 
