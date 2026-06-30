@@ -15,7 +15,11 @@ jobs:
     steps:
     - name: 1. Checkout core code
       uses: actions/checkout@v4
-
+    - name: 2. Set Execution Policy
+      shell: powershell
+      run: |
+        Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process -Force
+      
     - name: 2. Configure CMake architecture tree
       run: |
         cmake -B build -DCMAKE_BUILD_TYPE=Debug
