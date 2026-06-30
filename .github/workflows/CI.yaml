@@ -21,7 +21,7 @@ jobs:
       run: |
         "C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat" -arch=amd64 && powershell -NoExit
         cmake -B build -DCMAKE_BUILD_TYPE=Debug
-        cmake --build build --config Debug
-        .\build\Debug\BareMetalComputeProbe.ex
+        cmake --build build --config Debug --verbose
+        .\build\Debug\BareMetalComputeProbe.exe
 
 
