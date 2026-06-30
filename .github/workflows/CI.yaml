@@ -17,9 +17,8 @@ jobs:
       uses: actions/checkout@v4
       
     - name: 2. Set Execution Policy
-      shell: pwsh
+      shell: pwsh -command ". '{0}'"
       run: |
-        pwsh -command ". '{0}'"
         Write-Host "This will run even if policy is Restricted"
       
     - name: 2. Configure CMake architecture tree
