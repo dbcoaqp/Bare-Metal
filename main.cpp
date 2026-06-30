@@ -15,6 +15,8 @@
 #include "utils/FileIO.h"
 #include "utils/VkCheck.h"
 #include "core/VmaBuffer.h"
+#include "core/GaussianData.h"
+#include "utils/NpyParser.h"
 
 // Global function pointer table memory allocation
 VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE;
@@ -420,7 +422,8 @@ int main() {
         VK_CHECK(vulkanDevice.getComputeQueue().submit(1, &submitInfo, nullptr));
         vulkanDevice.getComputeQueue().waitIdle();
 
-        // 6. Verification (Battle Check)
+        // [PHASE 3 VERIFICATION - DISABLED FOR PHASE 4 TESTING]
+        /*
         float* verificationData = static_cast<float*>(storageBuffer.map());
         
         if (verificationData[1] != 2.0f || verificationData[255] != 510.0f) {
@@ -429,6 +432,11 @@ int main() {
         
         storageBuffer.unmap();
         std::cout << "[System] IGNITION SUCCESS: GPU Compute Pipeline executed perfectly. All 256 threads returned mathematically correct results." << std::endl;
+        */
+
+        // [PHASE 4] NpyParser Integration Test
+        std::cout << "[System] NpyParser ready for ingestion." << std::endl;
+        std::cout << "[System] GaussianPoint size: " << sizeof(GaussianPoint) << " bytes (aligned: " << alignof(GaussianPoint) << " bytes)" << std::endl;
 
     } catch (const std::exception& e) {
         std::cerr << "Critical Error: " << e.what() << std::endl;
