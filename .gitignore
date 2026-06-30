@@ -69,3 +69,6 @@ Testing/
 .cache/
 .aider*
 
+.DS_Store
+.npy
+.py

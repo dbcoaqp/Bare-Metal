@@ -1,6 +1,5 @@
 name: Project Bare Metal Native Vulkan CI
 
-# Trigger: Executes every time a push is made to the main branch or a pull request is initiated.
 on:
   push:
     branches: [ main ]
@@ -9,25 +8,28 @@ on:
 
 jobs:
   build-and-test:
-    # Forces the program to run on your physical Windows machine, instead of GitHub's cloud server.
     runs-on: [self-hosted, windows, x64]
 
     steps:
-    - name: 1. Checkout core code
+    - name: 1. Checkout core code & Submodules
       uses: actions/checkout@v4
-      
-    - name: 2. Build and Test
-      shell: cmd
+      with:
+        submodules: recursive 
+
+    - name: 2. Setup MSVC Environment
+      uses: ilammy/msvc-dev-cmd@v1
+
+    - name: 3. Configure CMake architecture tree
       run: |
-        call "C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat" -arch=amd64
-
-        where cl
-        where cmake
-    
         cmake -B build -DCMAKE_BUILD_TYPE=Debug
+
+    - name: 4. Incremental Compilation
+      run: |
         cmake --build build --config Debug --verbose
-    
+
+    - name: 5. GPU Compute Pipeline Execution (Physical Ignition)
+      env:
+        VK_INSTANCE_LAYERS: VK_LAYER_KHRONOS_validation
+      run: |
         echo "=== RUNNING TEST ==="
-        .\build\Debug\BareMetalComputeProbe.exe || exit /b 1  
-
-
+        .\build\Debug\BareMetalComputeProbe.exe || exit /b 1
