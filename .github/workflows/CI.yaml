@@ -24,8 +24,8 @@ jobs:
         where cl
         where cmake
     
-
-        
+        cmake -B build -DCMAKE_BUILD_TYPE=Debug
+        cmake --build build --config Debug --verbose
     
         echo "=== RUNNING TEST ==="
         .\build\Debug\BareMetalComputeProbe.exe || exit /b 1  
