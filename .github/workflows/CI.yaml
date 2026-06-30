@@ -23,6 +23,6 @@ jobs:
         cmake -B build -DCMAKE_BUILD_TYPE=Debug
         cmake --build build --config Debug
         powershell Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
-        .\build\x64-Debug\BareMetalComputeProbe.exe
+        .\build\x64-Debug\BareMetalComputeProbe.e
 
 
