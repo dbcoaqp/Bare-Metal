@@ -6,14 +6,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(Vulkan REQUIRED)
 
-include(FetchContent)
+add_subdirectory(third_party/VMA)
 
-FetchContent_Declare(
-    VulkanMemoryAllocator
-    GIT_REPOSITORY https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git
-    GIT_TAG v3.1.0
-)
-FetchContent_MakeAvailable(VulkanMemoryAllocator)
 
 # Offline SPIR-V compilation (CONVENTIONS.md §2: Runtime compilation is BANNED)
 find_program(GLSLC glslc REQUIRED)
