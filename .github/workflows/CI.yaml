@@ -32,4 +32,4 @@ jobs:
         VK_INSTANCE_LAYERS: VK_LAYER_KHRONOS_validation
       run: |
         echo "=== RUNNING TEST ==="
-        .\build\Debug\BareMetalComputeProbe.exe || exit /b 1
+        .\build\Debug\BareMetalComputeProbe.exe ; if (-not $?) { exit /b 1 }
