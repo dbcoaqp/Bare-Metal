@@ -11,11 +11,13 @@
 #include <map>
 #include <optional>
 #include <cstring>
+#include <iomanip>
 
 #include "utils/FileIO.h"
 #include "utils/VkCheck.h"
 #include "core/VmaBuffer.h"
 #include "core/GaussianData.h"
+#include "core/Camera.h"
 #include "utils/NpyParser.h"
 
 // Global function pointer table memory allocation
@@ -250,43 +252,42 @@ int main() {
         std::cout << "[System] VMA Allocator successfully engaged." << std::endl;
         std::cout << "--- Bare Metal Boot Sequence Completed ---" << std::endl;
 
-        // Read shader binary (path injected by CMake at build-time)
-        std::string shaderPath = std::string(SHADER_DIR) + "/probe.spv";
+        // Phase 6: GPU Sorting - Stage 1: Depth Key-Value Generation
+        
+        // 1. Read shader binary (path injected by CMake at build-time)
+        std::string shaderPath = std::string(SHADER_DIR) + "/calc_depth.spv";
         auto shaderCode = FileIO::readFile(shaderPath);
         std::cout << "[System] Shader loaded: " << shaderCode.size() << " bytes." << std::endl;
 
-        // Phase 5: DMA Data Transfer Pipeline
-        // 1. Parse Gaussian points from .npy file
+        // 2. Parse Gaussian points from .npy file
         std::string npyPath = std::string(SHADER_DIR) + "/test.npy";
         auto pointData = NpyParser::parse(npyPath);
-        vk::DeviceSize bufferSize = pointData.size() * sizeof(GaussianPoint);
+        vk::DeviceSize gaussianBufferSize = pointData.size() * sizeof(GaussianPoint);
         std::cout << "[System] Loaded " << pointData.size() << " Gaussian points (" 
-                  << bufferSize << " bytes)." << std::endl;
+                  << gaussianBufferSize << " bytes)." << std::endl;
 
-        // 2. Create staging buffer (CPU-accessible)
+        // 3. Create staging buffer and upload Gaussian data to GPU
         VmaBuffer stagingBuffer(
             vulkanDevice.getAllocator(),
-            bufferSize,
+            gaussianBufferSize,
             vk::BufferUsageFlagBits::eTransferSrc,
             VMA_MEMORY_USAGE_CPU_TO_GPU
         );
 
-        // 3. Map staging buffer and copy data
         void* mapped = stagingBuffer.map();
-        std::memcpy(mapped, pointData.data(), bufferSize);
+        std::memcpy(mapped, pointData.data(), gaussianBufferSize);
         stagingBuffer.flush();
         stagingBuffer.unmap();
         std::cout << "[System] Staging buffer populated with Gaussian data." << std::endl;
 
-        // 4. Create GPU-only storage buffer (Device Local VRAM)
         VmaBuffer gaussianBuffer(
             vulkanDevice.getAllocator(),
-            bufferSize,
+            gaussianBufferSize,
             vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc,
             VMA_MEMORY_USAGE_GPU_ONLY
         );
 
-        // 5. Create command pool (needed for both DMA transfer and compute dispatch)
+        // 4. Create command pool
         vk::CommandPoolCreateInfo commandPoolCreateInfo(
             vk::CommandPoolCreateFlags(),
             target.indices.computeFamily.value()
@@ -294,7 +295,7 @@ int main() {
 
         auto commandPool = vulkanDevice.getDevice().createCommandPoolUnique(commandPoolCreateInfo);
 
-        // 6. One-time DMA transfer command
+        // 5. DMA transfer Gaussian data to GPU
         vk::CommandBufferAllocateInfo tempCmdBufInfo(
             *commandPool,
             vk::CommandBufferLevel::ePrimary,
@@ -306,7 +307,7 @@ int main() {
         vk::CommandBufferBeginInfo tempBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
         tempCmdBuffer->begin(tempBeginInfo);
 
-        vk::BufferCopy copyRegion(0, 0, bufferSize);
+        vk::BufferCopy copyRegion(0, 0, gaussianBufferSize);
         tempCmdBuffer->copyBuffer(
             stagingBuffer.getBuffer(),
             gaussianBuffer.getBuffer(),
@@ -324,9 +325,41 @@ int main() {
         VK_CHECK(vulkanDevice.getComputeQueue().submit(1, &tempSubmitInfo, nullptr));
         vulkanDevice.getComputeQueue().waitIdle();
         std::cout << "[System] DMA Transfer Complete: Gaussian data injected into Device Local VRAM." << std::endl;
-        // tempCmdBuffers released here (RAII); stagingBuffer also released at scope exit
 
-        // 1. Create Shader Module (RAII)
+        // 6. Create Camera Uniform Buffer with fake data
+        CameraUniform cameraData{};
+        // Identity viewProj matrix (column-major)
+        cameraData.viewProj[0] = 1.0f; cameraData.viewProj[5] = 1.0f;
+        cameraData.viewProj[10] = 1.0f; cameraData.viewProj[15] = 1.0f;
+        // Camera position at (0, 0, -5)
+        cameraData.cameraPosition[0] = 0.0f;
+        cameraData.cameraPosition[1] = 0.0f;
+        cameraData.cameraPosition[2] = -5.0f;
+
+        VmaBuffer cameraBuffer(
+            vulkanDevice.getAllocator(),
+            sizeof(CameraUniform),
+            vk::BufferUsageFlagBits::eUniformBuffer,
+            VMA_MEMORY_USAGE_CPU_TO_GPU
+        );
+
+        void* cameraMapped = cameraBuffer.map();
+        std::memcpy(cameraMapped, &cameraData, sizeof(CameraUniform));
+        cameraBuffer.flush();
+        cameraBuffer.unmap();
+        std::cout << "[System] Camera buffer created with position (0, 0, -5)." << std::endl;
+
+        // 7. Create Sort Key Buffer
+        vk::DeviceSize sortKeyBufferSize = pointData.size() * sizeof(SortKeyPair);
+        VmaBuffer sortKeyBuffer(
+            vulkanDevice.getAllocator(),
+            sortKeyBufferSize,
+            vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eTransferSrc,
+            VMA_MEMORY_USAGE_GPU_ONLY
+        );
+        std::cout << "[System] Sort key buffer created (" << sortKeyBufferSize << " bytes)." << std::endl;
+
+        // 8. Create Shader Module
         vk::ShaderModuleCreateInfo shaderModuleCreateInfo(
             vk::ShaderModuleCreateFlags(),
             shaderCode.size(),
@@ -335,45 +368,64 @@ int main() {
         auto shaderModule = vulkanDevice.getDevice().createShaderModuleUnique(shaderModuleCreateInfo);
         std::cout << "[System] Compute Shader Module compiled." << std::endl;
 
-        // 2. Create Descriptor Set Layout & Pool (Contract & Pool)
-        vk::DescriptorSetLayoutBinding layoutBinding(
-            0,                                // binding
-            vk::DescriptorType::eStorageBuffer,
-            1,                                // descriptorCount
-            vk::ShaderStageFlagBits::eCompute
-        );
+        // 9. Create Descriptor Set Layout (3 bindings)
+        std::vector<vk::DescriptorSetLayoutBinding> layoutBindings = {
+            // binding 0: GaussianBuffer (SSBO, read-only)
+            vk::DescriptorSetLayoutBinding(
+                0,
+                vk::DescriptorType::eStorageBuffer,
+                1,
+                vk::ShaderStageFlagBits::eCompute
+            ),
+            // binding 1: SortKeyBuffer (SSBO)
+            vk::DescriptorSetLayoutBinding(
+                1,
+                vk::DescriptorType::eStorageBuffer,
+                1,
+                vk::ShaderStageFlagBits::eCompute
+            ),
+            // binding 2: CameraBuffer (UBO)
+            vk::DescriptorSetLayoutBinding(
+                2,
+                vk::DescriptorType::eUniformBuffer,
+                1,
+                vk::ShaderStageFlagBits::eCompute
+            )
+        };
 
         vk::DescriptorSetLayoutCreateInfo layoutCreateInfo(
             vk::DescriptorSetLayoutCreateFlags(),
-            1,                                // bindingCount
-            &layoutBinding
+            static_cast<uint32_t>(layoutBindings.size()),
+            layoutBindings.data()
         );
 
         auto descriptorSetLayout = vulkanDevice.getDevice().createDescriptorSetLayoutUnique(layoutCreateInfo);
 
-        vk::DescriptorPoolSize poolSize(
-            vk::DescriptorType::eStorageBuffer,
-            1                                 // descriptorCount
-        );
+        // 10. Create Descriptor Pool
+        std::vector<vk::DescriptorPoolSize> poolSizes = {
+            vk::DescriptorPoolSize(vk::DescriptorType::eStorageBuffer, 2),
+            vk::DescriptorPoolSize(vk::DescriptorType::eUniformBuffer, 1)
+        };
 
         vk::DescriptorPoolCreateInfo poolCreateInfo(
             vk::DescriptorPoolCreateFlags(),
-            1,                                // maxSets
-            1,                                // poolSizeCount
-            &poolSize
+            1,  // maxSets
+            static_cast<uint32_t>(poolSizes.size()),
+            poolSizes.data()
         );
 
         auto descriptorPool = vulkanDevice.getDevice().createDescriptorPoolUnique(poolCreateInfo);
 
-        // 3. Forge Compute Pipeline (State Machine)
+        // 11. Create Pipeline Layout
         vk::PipelineLayoutCreateInfo pipelineLayoutCreateInfo(
             vk::PipelineLayoutCreateFlags(),
-            1,                                // setLayoutCount
+            1,
             &*descriptorSetLayout
         );
 
         auto pipelineLayout = vulkanDevice.getDevice().createPipelineLayoutUnique(pipelineLayoutCreateInfo);
 
+        // 12. Create Compute Pipeline
         vk::PipelineShaderStageCreateInfo stageCreateInfo(
             vk::PipelineShaderStageCreateFlags(),
             vk::ShaderStageFlagBits::eCompute,
@@ -388,7 +440,7 @@ int main() {
         );
 
         auto computePipelineResult = vulkanDevice.getDevice().createComputePipelineUnique(
-            nullptr,                          // pipelineCache
+            nullptr,
             computePipelineCreateInfo
         );
 
@@ -398,45 +450,82 @@ int main() {
 
         auto computePipeline = std::move(computePipelineResult.value);
 
-        // 4. Update Descriptor Set (Bind Contract)
+        // 13. Allocate and Update Descriptor Sets
         vk::DescriptorSetAllocateInfo descriptorSetAllocateInfo(
             *descriptorPool,
-            1,                                // descriptorSetCount
+            1,
             &*descriptorSetLayout
         );
 
         auto descriptorSets = vulkanDevice.getDevice().allocateDescriptorSets(descriptorSetAllocateInfo);
         auto descriptorSet = descriptorSets[0];
 
-        vk::DescriptorBufferInfo bufferInfo(
-            gaussianBuffer.getBuffer(),       // Device Local VRAM
-            0,                                // offset
-            bufferSize
+        vk::DescriptorBufferInfo gaussianBufferInfo(
+            gaussianBuffer.getBuffer(),
+            0,
+            gaussianBufferSize
         );
 
-        vk::WriteDescriptorSet writeDescriptorSet(
-            descriptorSet,
-            0,                                // dstBinding
-            0,                                // dstArrayElement
-            1,                                // descriptorCount
-            vk::DescriptorType::eStorageBuffer,
-            nullptr,                          // pImageInfo
-            &bufferInfo,
-            nullptr                           // pTexelBufferView
+        vk::DescriptorBufferInfo sortKeyBufferInfo(
+            sortKeyBuffer.getBuffer(),
+            0,
+            sortKeyBufferSize
         );
+
+        vk::DescriptorBufferInfo cameraBufferInfo(
+            cameraBuffer.getBuffer(),
+            0,
+            sizeof(CameraUniform)
+        );
+
+        std::vector<vk::WriteDescriptorSet> descriptorWrites = {
+            // binding 0: GaussianBuffer
+            vk::WriteDescriptorSet(
+                descriptorSet,
+                0,
+                0,
+                1,
+                vk::DescriptorType::eStorageBuffer,
+                nullptr,
+                &gaussianBufferInfo,
+                nullptr
+            ),
+            // binding 1: SortKeyBuffer
+            vk::WriteDescriptorSet(
+                descriptorSet,
+                1,
+                0,
+                1,
+                vk::DescriptorType::eStorageBuffer,
+                nullptr,
+                &sortKeyBufferInfo,
+                nullptr
+            ),
+            // binding 2: CameraBuffer
+            vk::WriteDescriptorSet(
+                descriptorSet,
+                2,
+                0,
+                1,
+                vk::DescriptorType::eUniformBuffer,
+                nullptr,
+                &cameraBufferInfo,
+                nullptr
+            )
+        };
 
         vulkanDevice.getDevice().updateDescriptorSets(
-            1,                                // descriptorWriteCount
-            &writeDescriptorSet,
-            0,                                // descriptorCopyCount
-            nullptr                           // pDescriptorCopies
+            static_cast<uint32_t>(descriptorWrites.size()),
+            descriptorWrites.data(),
+            0,
+            nullptr
         );
 
-        // 5. Record and Dispatch (Command & Fire)
+        // 14. Record and Dispatch Compute
         vk::CommandBufferAllocateInfo commandBufferAllocateInfo(
             *commandPool,
             vk::CommandBufferLevel::ePrimary,
-            1                                 // commandBufferCount
+            1
         );
 
         auto commandBuffers = vulkanDevice.getDevice().allocateCommandBuffersUnique(commandBufferAllocateInfo);
@@ -448,14 +537,13 @@ int main() {
         commandBuffer->bindDescriptorSets(
             vk::PipelineBindPoint::eCompute,
             *pipelineLayout,
-            0,                                // firstSet
-            1,                                // descriptorSetCount
+            0,
+            1,
             &descriptorSet,
-            0,                                // dynamicOffsetCount
-            nullptr                           // pDynamicOffsets
+            0,
+            nullptr
         );
 
-        // Dynamic Dispatch: calculate workgroup count based on actual point count
         uint32_t groupCountX = (static_cast<uint32_t>(pointData.size()) + 255) / 256;
         commandBuffer->dispatch(groupCountX, 1, 1);
         std::cout << "[System] Dispatched " << groupCountX << " workgroups for " << pointData.size() << " points." << std::endl;
@@ -463,29 +551,23 @@ int main() {
         commandBuffer->end();
 
         vk::SubmitInfo submitInfo(
-            0,                                // waitSemaphoreCount
-            nullptr,                          // pWaitSemaphores
-            nullptr,                          // pWaitDstStageMask
-            1,                                // commandBufferCount
-            &*commandBuffer
+            0, nullptr, nullptr,
+            1, &*commandBuffer
         );
 
         VK_CHECK(vulkanDevice.getComputeQueue().submit(1, &submitInfo, nullptr));
         vulkanDevice.getComputeQueue().waitIdle();
 
-        std::cout << "[System] GaussianPoint size: " << sizeof(GaussianPoint) << " bytes (aligned: " << alignof(GaussianPoint) << " bytes)" << std::endl;
         std::cout << "[System] Compute dispatch complete." << std::endl;
 
-        // Phase 5: Reverse DMA & Verification (回程高铁)
-        // 1. Create readback buffer (GPU → CPU)
+        // 15. Reverse DMA: Readback SortKeyBuffer for verification (回程高铁)
         VmaBuffer readbackBuffer(
             vulkanDevice.getAllocator(),
-            bufferSize,
+            sortKeyBufferSize,
             vk::BufferUsageFlagBits::eTransferDst,
             VMA_MEMORY_USAGE_GPU_TO_CPU
         );
 
-        // 2. Allocate temporary command buffer for readback
         vk::CommandBufferAllocateInfo readbackCmdBufInfo(
             *commandPool,
             vk::CommandBufferLevel::ePrimary,
@@ -494,20 +576,18 @@ int main() {
         auto readbackCmdBuffers = vulkanDevice.getDevice().allocateCommandBuffersUnique(readbackCmdBufInfo);
         auto& readbackCmdBuffer = readbackCmdBuffers[0];
 
-        // 3. Record copy command
         vk::CommandBufferBeginInfo readbackBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
         readbackCmdBuffer->begin(readbackBeginInfo);
 
-        vk::BufferCopy readbackCopyRegion(0, 0, bufferSize);
+        vk::BufferCopy readbackCopyRegion(0, 0, sortKeyBufferSize);
         readbackCmdBuffer->copyBuffer(
-            gaussianBuffer.getBuffer(),
+            sortKeyBuffer.getBuffer(),
             readbackBuffer.getBuffer(),
             readbackCopyRegion
         );
 
         readbackCmdBuffer->end();
 
-        // 4. Submit and wait
         vk::SubmitInfo readbackSubmitInfo(
             0, nullptr, nullptr,
             1, &*readbackCmdBuffer,
@@ -517,17 +597,27 @@ int main() {
         VK_CHECK(vulkanDevice.getComputeQueue().submit(1, &readbackSubmitInfo, nullptr));
         vulkanDevice.getComputeQueue().waitIdle();
 
-        // 5. Map readback buffer and verify compute results
-        GaussianPoint* readbackData = static_cast<GaussianPoint*>(readbackBuffer.map());
+        // 16. Verify results
+        SortKeyPair* readbackData = static_cast<SortKeyPair*>(readbackBuffer.map());
 
-        std::cout << "[System] Verification: Point[0] position = (" 
-                  << readbackData[0].position[0] << ", "
-                  << readbackData[0].position[1] << ", "
-                  << readbackData[0].position[2] << ")" << std::endl;
+        std::cout << "\n[System] === Depth Verification ===" << std::endl;
+        std::cout << std::fixed << std::setprecision(4);
+        
+        if (pointData.size() > 0) {
+            std::cout << "[System] SortKeyPair[0]: depth = " << readbackData[0].depth 
+                      << ", index = " << readbackData[0].index << std::endl;
+        }
+        
+        if (pointData.size() > 100) {
+            std::cout << "[System] SortKeyPair[100]: depth = " << readbackData[100].depth 
+                      << ", index = " << readbackData[100].index << std::endl;
+        }
+
+        std::cout << "[System] === Verification Complete ===" << std::endl;
 
         readbackBuffer.unmap();
 
-        std::cout << "[System] VERIFICATION SUCCESS: Reverse DMA readback and compute verification complete." << std::endl;
+        std::cout << "[System] VERIFICATION SUCCESS: Depth Key-Value generation complete." << std::endl;
 
     } catch (const std::exception& e) {
         std::cerr << "Critical Error: " << e.what() << std::endl;

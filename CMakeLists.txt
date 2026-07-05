@@ -12,14 +12,14 @@ add_subdirectory(third_party/VMA)
 # Offline SPIR-V compilation (CONVENTIONS.md §2: Runtime compilation is BANNED)
 find_program(GLSLC glslc REQUIRED)
 
-set(SHADER_SRC "${CMAKE_SOURCE_DIR}/shaders/probe.comp")
-set(SHADER_BIN "${CMAKE_SOURCE_DIR}/shaders/probe.spv")
+set(SHADER_SRC "${CMAKE_SOURCE_DIR}/shaders/calc_depth.comp")
+set(SHADER_BIN "${CMAKE_SOURCE_DIR}/shaders/calc_depth.spv")
 
 add_custom_command(
     OUTPUT ${SHADER_BIN}
     COMMAND ${GLSLC} ${SHADER_SRC} -o ${SHADER_BIN}
     DEPENDS ${SHADER_SRC}
-    COMMENT "Compiling compute shader: probe.comp -> probe.spv"
+    COMMENT "Compiling compute shader: calc_depth.comp -> calc_depth.spv"
 )
 
 add_custom_target(CompileShaders ALL DEPENDS ${SHADER_BIN})

@@ -1,0 +1,42 @@
+#version 460
+
+layout (local_size_x = 256) in;
+
+struct GaussianPoint {
+    vec3 position;
+    float scale;
+    vec3 color;
+    float opacity;
+    vec4 rot;
+};
+
+struct SortKeyPair {
+    float depth;
+    uint index;
+};
+
+layout(std430, binding = 0) readonly buffer GaussianBuffer {
+    GaussianPoint gaussians[];
+};
+
+layout(std430, binding = 1) buffer SortKeyBuffer {
+    SortKeyPair sortKeys[];
+};
+
+layout(std140, binding = 2) uniform CameraUBO {
+    mat4 viewProj;
+    vec3 cameraPosition;
+};
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    
+    // Guard against out-of-bounds access
+    if (index >= gaussians.length()) return;
+    
+    vec3 pos = gaussians[index].position;
+    float depth = length(pos - cameraPosition);
+    
+    sortKeys[index].depth = depth;
+    sortKeys[index].index = index;
+}
