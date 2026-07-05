@@ -282,7 +282,7 @@ int main() {
         VmaBuffer gaussianBuffer(
             vulkanDevice.getAllocator(),
             bufferSize,
-            vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eStorageBuffer,
+            vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc,
             VMA_MEMORY_USAGE_GPU_ONLY
         );
 
@@ -454,7 +454,12 @@ int main() {
             0,                                // dynamicOffsetCount
             nullptr                           // pDynamicOffsets
         );
-        commandBuffer->dispatch(1, 1, 1);     // 256 points / local_size_x=256 = 1 workgroup
+
+        // Dynamic Dispatch: calculate workgroup count based on actual point count
+        uint32_t groupCountX = (static_cast<uint32_t>(pointData.size()) + 255) / 256;
+        commandBuffer->dispatch(groupCountX, 1, 1);
+        std::cout << "[System] Dispatched " << groupCountX << " workgroups for " << pointData.size() << " points." << std::endl;
+
         commandBuffer->end();
 
         vk::SubmitInfo submitInfo(
@@ -470,6 +475,59 @@ int main() {
 
         std::cout << "[System] GaussianPoint size: " << sizeof(GaussianPoint) << " bytes (aligned: " << alignof(GaussianPoint) << " bytes)" << std::endl;
         std::cout << "[System] Compute dispatch complete." << std::endl;
+
+        // Phase 5: Reverse DMA & Verification (回程高铁)
+        // 1. Create readback buffer (GPU → CPU)
+        VmaBuffer readbackBuffer(
+            vulkanDevice.getAllocator(),
+            bufferSize,
+            vk::BufferUsageFlagBits::eTransferDst,
+            VMA_MEMORY_USAGE_GPU_TO_CPU
+        );
+
+        // 2. Allocate temporary command buffer for readback
+        vk::CommandBufferAllocateInfo readbackCmdBufInfo(
+            *commandPool,
+            vk::CommandBufferLevel::ePrimary,
+            1
+        );
+        auto readbackCmdBuffers = vulkanDevice.getDevice().allocateCommandBuffersUnique(readbackCmdBufInfo);
+        auto& readbackCmdBuffer = readbackCmdBuffers[0];
+
+        // 3. Record copy command
+        vk::CommandBufferBeginInfo readbackBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
+        readbackCmdBuffer->begin(readbackBeginInfo);
+
+        vk::BufferCopy readbackCopyRegion(0, 0, bufferSize);
+        readbackCmdBuffer->copyBuffer(
+            gaussianBuffer.getBuffer(),
+            readbackBuffer.getBuffer(),
+            readbackCopyRegion
+        );
+
+        readbackCmdBuffer->end();
+
+        // 4. Submit and wait
+        vk::SubmitInfo readbackSubmitInfo(
+            0, nullptr, nullptr,
+            1, &*readbackCmdBuffer,
+            0, nullptr
+        );
+
+        VK_CHECK(vulkanDevice.getComputeQueue().submit(1, &readbackSubmitInfo, nullptr));
+        vulkanDevice.getComputeQueue().waitIdle();
+
+        // 5. Map readback buffer and verify compute results
+        GaussianPoint* readbackData = static_cast<GaussianPoint*>(readbackBuffer.map());
+
+        std::cout << "[System] Verification: Point[0] position = (" 
+                  << readbackData[0].position[0] << ", "
+                  << readbackData[0].position[1] << ", "
+                  << readbackData[0].position[2] << ")" << std::endl;
+
+        readbackBuffer.unmap();
+
+        std::cout << "[System] VERIFICATION SUCCESS: Reverse DMA readback and compute verification complete." << std::endl;
 
     } catch (const std::exception& e) {
         std::cerr << "Critical Error: " << e.what() << std::endl;
