@@ -255,23 +255,76 @@ int main() {
         auto shaderCode = FileIO::readFile(shaderPath);
         std::cout << "[System] Shader loaded: " << shaderCode.size() << " bytes." << std::endl;
 
-        // Create and test VMA Storage Buffer
-        VmaBuffer storageBuffer(
+        // Phase 5: DMA Data Transfer Pipeline
+        // 1. Parse Gaussian points from .npy file
+        std::string npyPath = std::string(SHADER_DIR) + "/test.npy";
+        auto pointData = NpyParser::parse(npyPath);
+        vk::DeviceSize bufferSize = pointData.size() * sizeof(GaussianPoint);
+        std::cout << "[System] Loaded " << pointData.size() << " Gaussian points (" 
+                  << bufferSize << " bytes)." << std::endl;
+
+        // 2. Create staging buffer (CPU-accessible)
+        VmaBuffer stagingBuffer(
             vulkanDevice.getAllocator(),
-            sizeof(float) * 256,
-            vk::BufferUsageFlagBits::eStorageBuffer,
+            bufferSize,
+            vk::BufferUsageFlagBits::eTransferSrc,
             VMA_MEMORY_USAGE_CPU_TO_GPU
         );
 
-        // Map buffer and populate with data 0.0f to 255.0f
-        float* mappedData = static_cast<float*>(storageBuffer.map());
-        for (uint32_t i = 0; i < 256; ++i) {
-            mappedData[i] = static_cast<float>(i);
-        }
-        storageBuffer.flush();
-        storageBuffer.unmap();
+        // 3. Map staging buffer and copy data
+        void* mapped = stagingBuffer.map();
+        std::memcpy(mapped, pointData.data(), bufferSize);
+        stagingBuffer.flush();
+        stagingBuffer.unmap();
+        std::cout << "[System] Staging buffer populated with Gaussian data." << std::endl;
 
-        std::cout << "[System] VMA Storage Buffer successfully mapped and populated." << std::endl;
+        // 4. Create GPU-only storage buffer (Device Local VRAM)
+        VmaBuffer gaussianBuffer(
+            vulkanDevice.getAllocator(),
+            bufferSize,
+            vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eStorageBuffer,
+            VMA_MEMORY_USAGE_GPU_ONLY
+        );
+
+        // 5. Create command pool (needed for both DMA transfer and compute dispatch)
+        vk::CommandPoolCreateInfo commandPoolCreateInfo(
+            vk::CommandPoolCreateFlags(),
+            target.indices.computeFamily.value()
+        );
+
+        auto commandPool = vulkanDevice.getDevice().createCommandPoolUnique(commandPoolCreateInfo);
+
+        // 6. One-time DMA transfer command
+        vk::CommandBufferAllocateInfo tempCmdBufInfo(
+            *commandPool,
+            vk::CommandBufferLevel::ePrimary,
+            1
+        );
+        auto tempCmdBuffers = vulkanDevice.getDevice().allocateCommandBuffersUnique(tempCmdBufInfo);
+        auto& tempCmdBuffer = tempCmdBuffers[0];
+
+        vk::CommandBufferBeginInfo tempBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
+        tempCmdBuffer->begin(tempBeginInfo);
+
+        vk::BufferCopy copyRegion(0, 0, bufferSize);
+        tempCmdBuffer->copyBuffer(
+            stagingBuffer.getBuffer(),
+            gaussianBuffer.getBuffer(),
+            copyRegion
+        );
+
+        tempCmdBuffer->end();
+
+        vk::SubmitInfo tempSubmitInfo(
+            0, nullptr, nullptr,
+            1, &*tempCmdBuffer,
+            0, nullptr
+        );
+
+        VK_CHECK(vulkanDevice.getComputeQueue().submit(1, &tempSubmitInfo, nullptr));
+        vulkanDevice.getComputeQueue().waitIdle();
+        std::cout << "[System] DMA Transfer Complete: Gaussian data injected into Device Local VRAM." << std::endl;
+        // tempCmdBuffers released here (RAII); stagingBuffer also released at scope exit
 
         // 1. Create Shader Module (RAII)
         vk::ShaderModuleCreateInfo shaderModuleCreateInfo(
@@ -356,9 +409,9 @@ int main() {
         auto descriptorSet = descriptorSets[0];
 
         vk::DescriptorBufferInfo bufferInfo(
-            storageBuffer.getBuffer(),
+            gaussianBuffer.getBuffer(),       // Device Local VRAM
             0,                                // offset
-            VK_WHOLE_SIZE
+            bufferSize
         );
 
         vk::WriteDescriptorSet writeDescriptorSet(
@@ -380,13 +433,6 @@ int main() {
         );
 
         // 5. Record and Dispatch (Command & Fire)
-        vk::CommandPoolCreateInfo commandPoolCreateInfo(
-            vk::CommandPoolCreateFlags(),
-            target.indices.computeFamily.value()
-        );
-
-        auto commandPool = vulkanDevice.getDevice().createCommandPoolUnique(commandPoolCreateInfo);
-
         vk::CommandBufferAllocateInfo commandBufferAllocateInfo(
             *commandPool,
             vk::CommandBufferLevel::ePrimary,
@@ -408,7 +454,7 @@ int main() {
             0,                                // dynamicOffsetCount
             nullptr                           // pDynamicOffsets
         );
-        commandBuffer->dispatch(1, 1, 1);     // 1 workgroup = 256 threads (local_size_x=256)
+        commandBuffer->dispatch(1, 1, 1);     // 256 points / local_size_x=256 = 1 workgroup
         commandBuffer->end();
 
         vk::SubmitInfo submitInfo(
@@ -422,21 +468,8 @@ int main() {
         VK_CHECK(vulkanDevice.getComputeQueue().submit(1, &submitInfo, nullptr));
         vulkanDevice.getComputeQueue().waitIdle();
 
-        // [PHASE 3 VERIFICATION - DISABLED FOR PHASE 4 TESTING]
-        /*
-        float* verificationData = static_cast<float*>(storageBuffer.map());
-        
-        if (verificationData[1] != 2.0f || verificationData[255] != 510.0f) {
-            throw std::runtime_error("Fatal: GPU computation verification failed!");
-        }
-        
-        storageBuffer.unmap();
-        std::cout << "[System] IGNITION SUCCESS: GPU Compute Pipeline executed perfectly. All 256 threads returned mathematically correct results." << std::endl;
-        */
-
-        // [PHASE 4] NpyParser Integration Test
-        std::cout << "[System] NpyParser ready for ingestion." << std::endl;
         std::cout << "[System] GaussianPoint size: " << sizeof(GaussianPoint) << " bytes (aligned: " << alignof(GaussianPoint) << " bytes)" << std::endl;
+        std::cout << "[System] Compute dispatch complete." << std::endl;
 
     } catch (const std::exception& e) {
         std::cerr << "Critical Error: " << e.what() << std::endl;
