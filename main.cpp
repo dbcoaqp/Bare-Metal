@@ -335,6 +335,13 @@ int main() {
         cameraData.cameraPosition[0] = 0.0f;
         cameraData.cameraPosition[1] = 0.0f;
         cameraData.cameraPosition[2] = -5.0f;
+        cameraData.cameraPosition[3] = 0.0f; // pad
+
+        // Camera looking forward along +Z axis
+        cameraData.cameraForward[0] = 0.0f;
+        cameraData.cameraForward[1] = 0.0f;
+        cameraData.cameraForward[2] = 1.0f;
+        cameraData.cameraForward[3] = 0.0f; // pad
 
         VmaBuffer cameraBuffer(
             vulkanDevice.getAllocator(),
@@ -347,7 +354,7 @@ int main() {
         std::memcpy(cameraMapped, &cameraData, sizeof(CameraUniform));
         cameraBuffer.flush();
         cameraBuffer.unmap();
-        std::cout << "[System] Camera buffer created with position (0, 0, -5)." << std::endl;
+        std::cout << "[System] Camera buffer created with position (0, 0, -5) and forward (0, 0, 1)." << std::endl;
 
         // 7. Create Sort Key Buffer
         vk::DeviceSize sortKeyBufferSize = pointData.size() * sizeof(SortKeyPair);

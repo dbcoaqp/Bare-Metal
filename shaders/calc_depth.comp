@@ -25,7 +25,8 @@ layout(std430, binding = 1) buffer SortKeyBuffer {
 
 layout(std140, binding = 2) uniform CameraUBO {
     mat4 viewProj;
-    vec3 cameraPosition;
+    vec4 cameraPosition;
+    vec4 cameraForward;
 };
 
 void main() {
@@ -35,7 +36,7 @@ void main() {
     if (index >= gaussians.length()) return;
     
     vec3 pos = gaussians[index].position;
-    float depth = length(pos - cameraPosition);
+    float depth = dot(pos - cameraPosition.xyz, cameraForward.xyz);
     
     sortKeys[index].depth = depth;
     sortKeys[index].index = index;
