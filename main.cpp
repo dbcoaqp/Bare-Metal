@@ -12,6 +12,7 @@
 #include <optional>
 #include <cstring>
 #include <iomanip>
+#include <algorithm>
 
 #include "utils/FileIO.h"
 #include "utils/VkCheck.h"
@@ -266,6 +267,14 @@ int main() {
         std::cout << "[System] Loaded " << pointData.size() << " Gaussian points (" 
                   << gaussianBufferSize << " bytes)." << std::endl;
 
+        // Calculate the smallest power-of-two >= pointData.size() for bitonic sort
+        uint32_t paddedCount = 1;
+        while (paddedCount < pointData.size()) {
+            paddedCount <<= 1;
+        }
+        std::cout << "[System] Bitonic sort padded count: " << paddedCount 
+                  << " (original: " << pointData.size() << ")." << std::endl;
+
         // 3. Create staging buffer and upload Gaussian data to GPU
         VmaBuffer stagingBuffer(
             vulkanDevice.getAllocator(),
@@ -356,15 +365,15 @@ int main() {
         cameraBuffer.unmap();
         std::cout << "[System] Camera buffer created with position (0, 0, -5) and forward (0, 0, 1)." << std::endl;
 
-        // 7. Create Sort Key Buffer
-        vk::DeviceSize sortKeyBufferSize = pointData.size() * sizeof(SortKeyPair);
+        // 7. Create Sort Key Buffer (padded to power-of-two for bitonic sort)
+        vk::DeviceSize sortKeyBufferSize = static_cast<vk::DeviceSize>(paddedCount) * sizeof(SortKeyPair);
         VmaBuffer sortKeyBuffer(
             vulkanDevice.getAllocator(),
             sortKeyBufferSize,
             vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eTransferSrc,
             VMA_MEMORY_USAGE_GPU_ONLY
         );
-        std::cout << "[System] Sort key buffer created (" << sortKeyBufferSize << " bytes)." << std::endl;
+        std::cout << "[System] Sort key buffer created (" << sortKeyBufferSize << " bytes, padded for bitonic sort)." << std::endl;
 
         // 8. Create Shader Module
         vk::ShaderModuleCreateInfo shaderModuleCreateInfo(
@@ -423,16 +432,24 @@ int main() {
 
         auto descriptorPool = vulkanDevice.getDevice().createDescriptorPoolUnique(poolCreateInfo);
 
-        // 11. Create Pipeline Layout
+        // 11. Create Pipeline Layout (with push constants for bitonic sort)
+        vk::PushConstantRange pushConstantRange(
+            vk::ShaderStageFlagBits::eCompute,
+            0,
+            sizeof(uint32_t) * 2  // k and j
+        );
+
         vk::PipelineLayoutCreateInfo pipelineLayoutCreateInfo(
             vk::PipelineLayoutCreateFlags(),
             1,
-            &*descriptorSetLayout
+            &*descriptorSetLayout,
+            1,
+            &pushConstantRange
         );
 
         auto pipelineLayout = vulkanDevice.getDevice().createPipelineLayoutUnique(pipelineLayoutCreateInfo);
 
-        // 12. Create Compute Pipeline
+        // 12. Create Compute Pipeline (calc_depth)
         vk::PipelineShaderStageCreateInfo stageCreateInfo(
             vk::PipelineShaderStageCreateFlags(),
             vk::ShaderStageFlagBits::eCompute,
@@ -456,6 +473,43 @@ int main() {
         }
 
         auto computePipeline = std::move(computePipelineResult.value);
+
+        // 12b. Load Bitonic Sort Shader and Create Sort Pipeline
+        std::string bitonicShaderPath = std::string(SHADER_DIR) + "/bitonic_sort.spv";
+        auto bitonicShaderCode = FileIO::readFile(bitonicShaderPath);
+        std::cout << "[System] Bitonic sort shader loaded: " << bitonicShaderCode.size() << " bytes." << std::endl;
+
+        vk::ShaderModuleCreateInfo bitonicShaderModuleCreateInfo(
+            vk::ShaderModuleCreateFlags(),
+            bitonicShaderCode.size(),
+            reinterpret_cast<const uint32_t*>(bitonicShaderCode.data())
+        );
+        auto bitonicShaderModule = vulkanDevice.getDevice().createShaderModuleUnique(bitonicShaderModuleCreateInfo);
+
+        vk::PipelineShaderStageCreateInfo bitonicStageCreateInfo(
+            vk::PipelineShaderStageCreateFlags(),
+            vk::ShaderStageFlagBits::eCompute,
+            *bitonicShaderModule,
+            "main"
+        );
+
+        vk::ComputePipelineCreateInfo bitonicPipelineCreateInfo(
+            vk::PipelineCreateFlags(),
+            bitonicStageCreateInfo,
+            *pipelineLayout  // Reuse the same pipeline layout
+        );
+
+        auto bitonicPipelineResult = vulkanDevice.getDevice().createComputePipelineUnique(
+            nullptr,
+            bitonicPipelineCreateInfo
+        );
+
+        if (bitonicPipelineResult.result != vk::Result::eSuccess) {
+            throw std::runtime_error("Fatal: Failed to create bitonic sort compute pipeline.");
+        }
+
+        auto sortPipeline = std::move(bitonicPipelineResult.value);
+        std::cout << "[System] Bitonic sort pipeline created." << std::endl;
 
         // 13. Allocate and Update Descriptor Sets
         vk::DescriptorSetAllocateInfo descriptorSetAllocateInfo(
@@ -540,6 +594,25 @@ int main() {
 
         vk::CommandBufferBeginInfo beginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
         commandBuffer->begin(beginInfo);
+
+        // (d) Pad the sort key buffer with -1.0f (0xBF800000) so padding elements sink to the end
+        commandBuffer->fillBuffer(sortKeyBuffer.getBuffer(), 0, VK_WHOLE_SIZE, 0xBF800000);
+
+        // (e) Barrier: TransferWrite -> ShaderRead/Write (fillBuffer must complete before compute shaders)
+        vk::MemoryBarrier fillBarrier(
+            vk::AccessFlagBits::eTransferWrite,
+            vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite
+        );
+        commandBuffer->pipelineBarrier(
+            vk::PipelineStageFlagBits::eTransfer,
+            vk::PipelineStageFlagBits::eComputeShader,
+            vk::DependencyFlags(),
+            1, &fillBarrier,
+            0, nullptr,
+            0, nullptr
+        );
+
+        // Dispatch calc_depth
         commandBuffer->bindPipeline(vk::PipelineBindPoint::eCompute, *computePipeline);
         commandBuffer->bindDescriptorSets(
             vk::PipelineBindPoint::eCompute,
@@ -554,6 +627,45 @@ int main() {
         uint32_t groupCountX = (static_cast<uint32_t>(pointData.size()) + 255) / 256;
         commandBuffer->dispatch(groupCountX, 1, 1);
         std::cout << "[System] Dispatched " << groupCountX << " workgroups for " << pointData.size() << " points." << std::endl;
+
+        // (f) Barrier: ShaderWrite -> ShaderRead/Write (depth calculation must complete before sorting)
+        vk::MemoryBarrier depthBarrier(
+            vk::AccessFlagBits::eShaderWrite,
+            vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite
+        );
+        commandBuffer->pipelineBarrier(
+            vk::PipelineStageFlagBits::eComputeShader,
+            vk::PipelineStageFlagBits::eComputeShader,
+            vk::DependencyFlags(),
+            1, &depthBarrier,
+            0, nullptr,
+            0, nullptr
+        );
+
+        // (g) Bitonic Sort - The Storm
+        commandBuffer->bindPipeline(vk::PipelineBindPoint::eCompute, *sortPipeline);
+        uint32_t sortGroupCountX = (paddedCount + 255) / 256;
+        for (uint32_t k = 2; k <= paddedCount; k <<= 1) {
+            for (uint32_t j = k / 2; j > 0; j >>= 1) {
+                uint32_t pcData[2] = {k, j};
+                commandBuffer->pushConstants<uint32_t>(*pipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, pcData);
+                commandBuffer->dispatch(sortGroupCountX, 1, 1);
+
+                // Barrier after each bitonic step
+                vk::MemoryBarrier sortBarrier(
+                    vk::AccessFlagBits::eShaderWrite,
+                    vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite
+                );
+                commandBuffer->pipelineBarrier(
+                    vk::PipelineStageFlagBits::eComputeShader,
+                    vk::PipelineStageFlagBits::eComputeShader,
+                    vk::DependencyFlags(),
+                    1, &sortBarrier,
+                    0, nullptr,
+                    0, nullptr
+                );
+            }
+        }
 
         commandBuffer->end();
 
@@ -618,6 +730,22 @@ int main() {
         if (pointData.size() > 100) {
             std::cout << "[System] SortKeyPair[100]: depth = " << readbackData[100].depth 
                       << ", index = " << readbackData[100].index << std::endl;
+        }
+
+        // (h) Bitonic sort verification: print first 5 elements and last valid element
+        std::cout << "\n[System] === Bitonic Sort Verification (Descending) ===" << std::endl;
+        std::cout << "[System] Padded count: " << paddedCount << ", Valid points: " << pointData.size() << std::endl;
+
+        uint32_t printCount = std::min(static_cast<uint32_t>(5), static_cast<uint32_t>(pointData.size()));
+        for (uint32_t i = 0; i < printCount; ++i) {
+            std::cout << "[System] SortKeyPair[" << i << "]: depth = " << readbackData[i].depth 
+                      << ", index = " << readbackData[i].index << std::endl;
+        }
+
+        if (pointData.size() > 1) {
+            uint32_t lastIdx = static_cast<uint32_t>(pointData.size()) - 1;
+            std::cout << "[System] SortKeyPair[" << lastIdx << "]: depth = " << readbackData[lastIdx].depth 
+                      << ", index = " << readbackData[lastIdx].index << std::endl;
         }
 
         std::cout << "[System] === Verification Complete ===" << std::endl;

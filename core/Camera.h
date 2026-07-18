@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <cstddef>
 
-struct CameraUniform {
+struct alignas(16) CameraUniform {
     float viewProj[16];        // 64 bytes
     float cameraPosition[4];   // 16 bytes (xyz + pad)
     float cameraForward[4];    // 16 bytes (xyz + pad)
