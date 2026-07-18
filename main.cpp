@@ -914,7 +914,7 @@ int main() {
 
         std::cout << "[System] === 2D Projection Verification Complete ===" << std::endl;
 
-        g2dReadbackBuffer.unmap();
+        gaussian2DReadbackBuffer.unmap();
 
         std::cout << "[System] VERIFICATION SUCCESS: 3D to 2D covariance projection complete." << std::endl;
 
