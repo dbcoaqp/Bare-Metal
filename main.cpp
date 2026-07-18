@@ -20,6 +20,7 @@
 #include "core/GaussianData.h"
 #include "core/Camera.h"
 #include "utils/NpyParser.h"
+#include "core/Gaussian2D.h"
 
 // Global function pointer table memory allocation
 VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE;
@@ -352,6 +353,16 @@ int main() {
         cameraData.cameraForward[2] = 1.0f;
         cameraData.cameraForward[3] = 0.0f; // pad
 
+        // Camera intrinsics for Jacobian computation
+        cameraData.focal_x = 1000.0f;
+        cameraData.focal_y = 1000.0f;
+        cameraData.tan_fovx = 0.5f;
+        cameraData.tan_fovy = 0.5f;
+        cameraData.viewport[0] = 1024.0f;
+        cameraData.viewport[1] = 768.0f;
+        cameraData.pad_cam[0] = 0.0f;
+        cameraData.pad_cam[1] = 0.0f;
+
         VmaBuffer cameraBuffer(
             vulkanDevice.getAllocator(),
             sizeof(CameraUniform),
@@ -375,6 +386,16 @@ int main() {
         );
         std::cout << "[System] Sort key buffer created (" << sortKeyBufferSize << " bytes, padded for bitonic sort)." << std::endl;
 
+        // 7b. Create Gaussian2D Output Buffer
+        vk::DeviceSize gaussian2DBufferSize = static_cast<vk::DeviceSize>(paddedCount) * sizeof(Gaussian2D);
+        VmaBuffer gaussian2DBuffer(
+            vulkanDevice.getAllocator(),
+            gaussian2DBufferSize,
+            vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc,
+            VMA_MEMORY_USAGE_GPU_ONLY
+        );
+        std::cout << "[System] Gaussian2D buffer created (" << gaussian2DBufferSize << " bytes)." << std::endl;
+
         // 8. Create Shader Module
         vk::ShaderModuleCreateInfo shaderModuleCreateInfo(
             vk::ShaderModuleCreateFlags(),
@@ -384,7 +405,7 @@ int main() {
         auto shaderModule = vulkanDevice.getDevice().createShaderModuleUnique(shaderModuleCreateInfo);
         std::cout << "[System] Compute Shader Module compiled." << std::endl;
 
-        // 9. Create Descriptor Set Layout (3 bindings)
+        // 9. Create Descriptor Set Layout (4 bindings)
         std::vector<vk::DescriptorSetLayoutBinding> layoutBindings = {
             // binding 0: GaussianBuffer (SSBO, read-only)
             vk::DescriptorSetLayoutBinding(
@@ -406,6 +427,13 @@ int main() {
                 vk::DescriptorType::eUniformBuffer,
                 1,
                 vk::ShaderStageFlagBits::eCompute
+            ),
+            // binding 3: Gaussian2DBuffer (SSBO, output)
+            vk::DescriptorSetLayoutBinding(
+                3,
+                vk::DescriptorType::eStorageBuffer,
+                1,
+                vk::ShaderStageFlagBits::eCompute
             )
         };
 
@@ -419,7 +447,7 @@ int main() {
 
         // 10. Create Descriptor Pool
         std::vector<vk::DescriptorPoolSize> poolSizes = {
-            vk::DescriptorPoolSize(vk::DescriptorType::eStorageBuffer, 2),
+            vk::DescriptorPoolSize(vk::DescriptorType::eStorageBuffer, 3),
             vk::DescriptorPoolSize(vk::DescriptorType::eUniformBuffer, 1)
         };
 
@@ -511,6 +539,43 @@ int main() {
         auto sortPipeline = std::move(bitonicPipelineResult.value);
         std::cout << "[System] Bitonic sort pipeline created." << std::endl;
 
+        // 12c. Load Preprocess Shader and Create Preprocess Pipeline
+        std::string preprocessShaderPath = std::string(SHADER_DIR) + "/preprocess.spv";
+        auto preprocessShaderCode = FileIO::readFile(preprocessShaderPath);
+        std::cout << "[System] Preprocess shader loaded: " << preprocessShaderCode.size() << " bytes." << std::endl;
+
+        vk::ShaderModuleCreateInfo preprocessShaderModuleCreateInfo(
+            vk::ShaderModuleCreateFlags(),
+            preprocessShaderCode.size(),
+            reinterpret_cast<const uint32_t*>(preprocessShaderCode.data())
+        );
+        auto preprocessShaderModule = vulkanDevice.getDevice().createShaderModuleUnique(preprocessShaderModuleCreateInfo);
+
+        vk::PipelineShaderStageCreateInfo preprocessStageCreateInfo(
+            vk::PipelineShaderStageCreateFlags(),
+            vk::ShaderStageFlagBits::eCompute,
+            *preprocessShaderModule,
+            "main"
+        );
+
+        vk::ComputePipelineCreateInfo preprocessPipelineCreateInfo(
+            vk::PipelineCreateFlags(),
+            preprocessStageCreateInfo,
+            *pipelineLayout
+        );
+
+        auto preprocessPipelineResult = vulkanDevice.getDevice().createComputePipelineUnique(
+            nullptr,
+            preprocessPipelineCreateInfo
+        );
+
+        if (preprocessPipelineResult.result != vk::Result::eSuccess) {
+            throw std::runtime_error("Fatal: Failed to create preprocess compute pipeline.");
+        }
+
+        auto preprocessPipeline = std::move(preprocessPipelineResult.value);
+        std::cout << "[System] Preprocess pipeline created." << std::endl;
+
         // 13. Allocate and Update Descriptor Sets
         vk::DescriptorSetAllocateInfo descriptorSetAllocateInfo(
             *descriptorPool,
@@ -537,6 +602,12 @@ int main() {
             cameraBuffer.getBuffer(),
             0,
             sizeof(CameraUniform)
+        );
+
+        vk::DescriptorBufferInfo gaussian2DBufferInfo(
+            gaussian2DBuffer.getBuffer(),
+            0,
+            gaussian2DBufferSize
         );
 
         std::vector<vk::WriteDescriptorSet> descriptorWrites = {
@@ -571,6 +642,17 @@ int main() {
                 vk::DescriptorType::eUniformBuffer,
                 nullptr,
                 &cameraBufferInfo,
+                nullptr
+            ),
+            // binding 3: Gaussian2DBuffer
+            vk::WriteDescriptorSet(
+                descriptorSet,
+                3,
+                0,
+                1,
+                vk::DescriptorType::eStorageBuffer,
+                nullptr,
+                &gaussian2DBufferInfo,
                 nullptr
             )
         };
@@ -667,6 +749,26 @@ int main() {
             }
         }
 
+        // (g2) Barrier: All sort writes must be visible before preprocess reads
+        vk::MemoryBarrier preprocessBarrier(
+            vk::AccessFlagBits::eShaderWrite,
+            vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite
+        );
+        commandBuffer->pipelineBarrier(
+            vk::PipelineStageFlagBits::eComputeShader,
+            vk::PipelineStageFlagBits::eComputeShader,
+            vk::DependencyFlags(),
+            1, &preprocessBarrier,
+            0, nullptr,
+            0, nullptr
+        );
+
+        // (h) Preprocess: 3D Covariance 2D Projection
+        commandBuffer->bindPipeline(vk::PipelineBindPoint::eCompute, *preprocessPipeline);
+        uint32_t preprocessGroupCountX = (paddedCount + 255) / 256;
+        commandBuffer->dispatch(preprocessGroupCountX, 1, 1);
+        std::cout << "[System] Dispatched " << preprocessGroupCountX << " workgroups for preprocess." << std::endl;
+
         commandBuffer->end();
 
         vk::SubmitInfo submitInfo(
@@ -753,6 +855,68 @@ int main() {
         readbackBuffer.unmap();
 
         std::cout << "[System] VERIFICATION SUCCESS: Depth Key-Value generation complete." << std::endl;
+
+        // 17. Reverse DMA: Readback Gaussian2DBuffer for projection verification
+        VmaBuffer gaussian2DReadbackBuffer(
+            vulkanDevice.getAllocator(),
+            gaussian2DBufferSize,
+            vk::BufferUsageFlagBits::eTransferDst,
+            VMA_MEMORY_USAGE_GPU_TO_CPU
+        );
+
+        vk::CommandBufferAllocateInfo g2dReadbackCmdBufInfo(
+            *commandPool,
+            vk::CommandBufferLevel::ePrimary,
+            1
+        );
+        auto g2dReadbackCmdBuffers = vulkanDevice.getDevice().allocateCommandBuffersUnique(g2dReadbackCmdBufInfo);
+        auto& g2dReadbackCmdBuffer = g2dReadbackCmdBuffers[0];
+
+        vk::CommandBufferBeginInfo g2dReadbackBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
+        g2dReadbackCmdBuffer->begin(g2dReadbackBeginInfo);
+
+        vk::BufferCopy g2dReadbackCopyRegion(0, 0, gaussian2DBufferSize);
+        g2dReadbackCmdBuffer->copyBuffer(
+            gaussian2DBuffer.getBuffer(),
+            gaussian2DReadbackBuffer.getBuffer(),
+            g2dReadbackCopyRegion
+        );
+
+        g2dReadbackCmdBuffer->end();
+
+        vk::SubmitInfo g2dReadbackSubmitInfo(
+            0, nullptr, nullptr,
+            1, &*g2dReadbackCmdBuffer,
+            0, nullptr
+        );
+
+        VK_CHECK(vulkanDevice.getComputeQueue().submit(1, &g2dReadbackSubmitInfo, nullptr));
+        vulkanDevice.getComputeQueue().waitIdle();
+
+        // 18. Verify 2D projection results
+        Gaussian2D* g2dReadbackData = static_cast<Gaussian2D*>(gaussian2DReadbackBuffer.map());
+
+        std::cout << "\n[System] === 2D Projection Verification ===" << std::endl;
+        std::cout << "[System] Padded count: " << paddedCount << ", Valid points: " << pointData.size() << std::endl;
+
+        uint32_t g2dPrintCount = std::min(static_cast<uint32_t>(5), static_cast<uint32_t>(pointData.size()));
+        for (uint32_t i = 0; i < g2dPrintCount; ++i) {
+            std::cout << "[System] Gaussian2D[" << i << "]: pos2D = (" 
+                      << g2dReadbackData[i].pos2D[0] << ", " << g2dReadbackData[i].pos2D[1] << ")"
+                      << ", depth = " << g2dReadbackData[i].depth
+                      << ", opacity = " << g2dReadbackData[i].opacity
+                      << ", conic = (" << g2dReadbackData[i].conic[0] << ", " 
+                      << g2dReadbackData[i].conic[1] << ", " << g2dReadbackData[i].conic[2] << ")"
+                      << ", color = (" << g2dReadbackData[i].color[0] << ", "
+                      << g2dReadbackData[i].color[1] << ", " << g2dReadbackData[i].color[2] << ")"
+                      << std::endl;
+        }
+
+        std::cout << "[System] === 2D Projection Verification Complete ===" << std::endl;
+
+        g2dReadbackBuffer.unmap();
+
+        std::cout << "[System] VERIFICATION SUCCESS: 3D to 2D covariance projection complete." << std::endl;
 
     } catch (const std::exception& e) {
         std::cerr << "Critical Error: " << e.what() << std::endl;

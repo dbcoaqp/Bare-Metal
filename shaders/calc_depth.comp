@@ -27,6 +27,12 @@ layout(std140, binding = 2) uniform CameraUBO {
     mat4 viewProj;
     vec4 cameraPosition;
     vec4 cameraForward;
+    float focal_x;
+    float focal_y;
+    float tan_fovx;
+    float tan_fovy;
+    vec2 viewport;
+    vec2 pad_cam;
 };
 
 void main() {

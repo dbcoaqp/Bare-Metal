@@ -18,6 +18,9 @@ set(SHADER_BIN "${CMAKE_SOURCE_DIR}/shaders/calc_depth.spv")
 set(BITONIC_SHADER_SRC "${CMAKE_SOURCE_DIR}/shaders/bitonic_sort.comp")
 set(BITONIC_SHADER_BIN "${CMAKE_SOURCE_DIR}/shaders/bitonic_sort.spv")
 
+set(PREPROCESS_SHADER_SRC "${CMAKE_SOURCE_DIR}/shaders/preprocess.comp")
+set(PREPROCESS_SHADER_BIN "${CMAKE_SOURCE_DIR}/shaders/preprocess.spv")
+
 add_custom_command(
     OUTPUT ${SHADER_BIN}
     COMMAND ${GLSLC} ${SHADER_SRC} -o ${SHADER_BIN}
@@ -32,7 +35,14 @@ add_custom_command(
     COMMENT "Compiling compute shader: bitonic_sort.comp -> bitonic_sort.spv"
 )
 
-add_custom_target(CompileShaders ALL DEPENDS ${SHADER_BIN} ${BITONIC_SHADER_BIN})
+add_custom_command(
+    OUTPUT ${PREPROCESS_SHADER_BIN}
+    COMMAND ${GLSLC} ${PREPROCESS_SHADER_SRC} -o ${PREPROCESS_SHADER_BIN}
+    DEPENDS ${PREPROCESS_SHADER_SRC}
+    COMMENT "Compiling compute shader: preprocess.comp -> preprocess.spv"
+)
+
+add_custom_target(CompileShaders ALL DEPENDS ${SHADER_BIN} ${BITONIC_SHADER_BIN} ${PREPROCESS_SHADER_BIN})
 
 include_directories(${Vulkan_INCLUDE_DIRS})
 include_directories(${CMAKE_SOURCE_DIR})
