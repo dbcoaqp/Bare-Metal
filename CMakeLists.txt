@@ -21,6 +21,9 @@ set(BITONIC_SHADER_BIN "${CMAKE_SOURCE_DIR}/shaders/bitonic_sort.spv")
 set(PREPROCESS_SHADER_SRC "${CMAKE_SOURCE_DIR}/shaders/preprocess.comp")
 set(PREPROCESS_SHADER_BIN "${CMAKE_SOURCE_DIR}/shaders/preprocess.spv")
 
+set(RASTERIZE_SHADER_SRC "${CMAKE_SOURCE_DIR}/shaders/rasterize.comp")
+set(RASTERIZE_SHADER_BIN "${CMAKE_SOURCE_DIR}/shaders/rasterize.spv")
+
 add_custom_command(
     OUTPUT ${SHADER_BIN}
     COMMAND ${GLSLC} ${SHADER_SRC} -o ${SHADER_BIN}
@@ -42,7 +45,14 @@ add_custom_command(
     COMMENT "Compiling compute shader: preprocess.comp -> preprocess.spv"
 )
 
-add_custom_target(CompileShaders ALL DEPENDS ${SHADER_BIN} ${BITONIC_SHADER_BIN} ${PREPROCESS_SHADER_BIN})
+add_custom_command(
+    OUTPUT ${RASTERIZE_SHADER_BIN}
+    COMMAND ${GLSLC} ${RASTERIZE_SHADER_SRC} -o ${RASTERIZE_SHADER_BIN}
+    DEPENDS ${RASTERIZE_SHADER_SRC}
+    COMMENT "Compiling compute shader: rasterize.comp -> rasterize.spv"
+)
+
+add_custom_target(CompileShaders ALL DEPENDS ${SHADER_BIN} ${BITONIC_SHADER_BIN} ${PREPROCESS_SHADER_BIN} ${RASTERIZE_SHADER_BIN})
 
 include_directories(${Vulkan_INCLUDE_DIRS})
 include_directories(${CMAKE_SOURCE_DIR})

@@ -13,6 +13,7 @@
 #include <cstring>
 #include <iomanip>
 #include <algorithm>
+#include <fstream>
 
 #include "utils/FileIO.h"
 #include "utils/VkCheck.h"
@@ -276,6 +277,9 @@ int main() {
         std::cout << "[System] Bitonic sort padded count: " << paddedCount 
                   << " (original: " << pointData.size() << ")." << std::endl;
 
+        uint32_t WIDTH = 1024;
+        uint32_t HEIGHT = 768;
+
         // 3. Create staging buffer and upload Gaussian data to GPU
         VmaBuffer stagingBuffer(
             vulkanDevice.getAllocator(),
@@ -396,6 +400,16 @@ int main() {
         );
         std::cout << "[System] Gaussian2D buffer created (" << gaussian2DBufferSize << " bytes)." << std::endl;
 
+        // 7c. Create Image Buffer for rasterization output
+        vk::DeviceSize imageBufferSize = static_cast<vk::DeviceSize>(WIDTH) * HEIGHT * sizeof(float) * 4;
+        VmaBuffer imageBuffer(
+            vulkanDevice.getAllocator(),
+            imageBufferSize,
+            vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc,
+            VMA_MEMORY_USAGE_GPU_ONLY
+        );
+        std::cout << "[System] Image buffer created (" << imageBufferSize << " bytes, " << WIDTH << "x" << HEIGHT << " RGBA)." << std::endl;
+
         // 8. Create Shader Module
         vk::ShaderModuleCreateInfo shaderModuleCreateInfo(
             vk::ShaderModuleCreateFlags(),
@@ -405,7 +419,7 @@ int main() {
         auto shaderModule = vulkanDevice.getDevice().createShaderModuleUnique(shaderModuleCreateInfo);
         std::cout << "[System] Compute Shader Module compiled." << std::endl;
 
-        // 9. Create Descriptor Set Layout (4 bindings)
+        // 9. Create Descriptor Set Layout (5 bindings)
         std::vector<vk::DescriptorSetLayoutBinding> layoutBindings = {
             // binding 0: GaussianBuffer (SSBO, read-only)
             vk::DescriptorSetLayoutBinding(
@@ -434,6 +448,13 @@ int main() {
                 vk::DescriptorType::eStorageBuffer,
                 1,
                 vk::ShaderStageFlagBits::eCompute
+            ),
+            // binding 4: ImageBuffer (SSBO, rasterization output)
+            vk::DescriptorSetLayoutBinding(
+                4,
+                vk::DescriptorType::eStorageBuffer,
+                1,
+                vk::ShaderStageFlagBits::eCompute
             )
         };
 
@@ -447,7 +468,7 @@ int main() {
 
         // 10. Create Descriptor Pool
         std::vector<vk::DescriptorPoolSize> poolSizes = {
-            vk::DescriptorPoolSize(vk::DescriptorType::eStorageBuffer, 3),
+            vk::DescriptorPoolSize(vk::DescriptorType::eStorageBuffer, 4),
             vk::DescriptorPoolSize(vk::DescriptorType::eUniformBuffer, 1)
         };
 
@@ -460,11 +481,11 @@ int main() {
 
         auto descriptorPool = vulkanDevice.getDevice().createDescriptorPoolUnique(poolCreateInfo);
 
-        // 11. Create Pipeline Layout (with push constants for bitonic sort)
+        // 11. Create Pipeline Layout (with push constants for bitonic sort and rasterize)
         vk::PushConstantRange pushConstantRange(
             vk::ShaderStageFlagBits::eCompute,
             0,
-            sizeof(uint32_t) * 2  // k and j
+            sizeof(uint32_t) * 3  // k, j (bitonic) and gaussianCount, width, height (rasterize)
         );
 
         vk::PipelineLayoutCreateInfo pipelineLayoutCreateInfo(
@@ -576,6 +597,43 @@ int main() {
         auto preprocessPipeline = std::move(preprocessPipelineResult.value);
         std::cout << "[System] Preprocess pipeline created." << std::endl;
 
+        // 12d. Load Rasterize Shader and Create Rasterize Pipeline
+        std::string rasterizeShaderPath = std::string(SHADER_DIR) + "/rasterize.spv";
+        auto rasterizeShaderCode = FileIO::readFile(rasterizeShaderPath);
+        std::cout << "[System] Rasterize shader loaded: " << rasterizeShaderCode.size() << " bytes." << std::endl;
+
+        vk::ShaderModuleCreateInfo rasterizeShaderModuleCreateInfo(
+            vk::ShaderModuleCreateFlags(),
+            rasterizeShaderCode.size(),
+            reinterpret_cast<const uint32_t*>(rasterizeShaderCode.data())
+        );
+        auto rasterizeShaderModule = vulkanDevice.getDevice().createShaderModuleUnique(rasterizeShaderModuleCreateInfo);
+
+        vk::PipelineShaderStageCreateInfo rasterizeStageCreateInfo(
+            vk::PipelineShaderStageCreateFlags(),
+            vk::ShaderStageFlagBits::eCompute,
+            *rasterizeShaderModule,
+            "main"
+        );
+
+        vk::ComputePipelineCreateInfo rasterizePipelineCreateInfo(
+            vk::PipelineCreateFlags(),
+            rasterizeStageCreateInfo,
+            *pipelineLayout
+        );
+
+        auto rasterizePipelineResult = vulkanDevice.getDevice().createComputePipelineUnique(
+            nullptr,
+            rasterizePipelineCreateInfo
+        );
+
+        if (rasterizePipelineResult.result != vk::Result::eSuccess) {
+            throw std::runtime_error("Fatal: Failed to create rasterize compute pipeline.");
+        }
+
+        auto rasterizePipeline = std::move(rasterizePipelineResult.value);
+        std::cout << "[System] Rasterize pipeline created." << std::endl;
+
         // 13. Allocate and Update Descriptor Sets
         vk::DescriptorSetAllocateInfo descriptorSetAllocateInfo(
             *descriptorPool,
@@ -608,6 +666,12 @@ int main() {
             gaussian2DBuffer.getBuffer(),
             0,
             gaussian2DBufferSize
+        );
+
+        vk::DescriptorBufferInfo imageBufferInfo(
+            imageBuffer.getBuffer(),
+            0,
+            imageBufferSize
         );
 
         std::vector<vk::WriteDescriptorSet> descriptorWrites = {
@@ -654,6 +718,17 @@ int main() {
                 nullptr,
                 &gaussian2DBufferInfo,
                 nullptr
+            ),
+            // binding 4: ImageBuffer
+            vk::WriteDescriptorSet(
+                descriptorSet,
+                4,
+                0,
+                1,
+                vk::DescriptorType::eStorageBuffer,
+                nullptr,
+                &imageBufferInfo,
+                nullptr
             )
         };
 
@@ -679,6 +754,7 @@ int main() {
 
         // (d) Pad the sort key buffer with -1.0f (0xBF800000) so padding elements sink to the end
         commandBuffer->fillBuffer(sortKeyBuffer.getBuffer(), 0, VK_WHOLE_SIZE, 0xBF800000);
+        commandBuffer->fillBuffer(gaussian2DBuffer.getBuffer(), 0, VK_WHOLE_SIZE, 0);
 
         // (e) Barrier: TransferWrite -> ShaderRead/Write (fillBuffer must complete before compute shaders)
         vk::MemoryBarrier fillBarrier(
@@ -768,6 +844,30 @@ int main() {
         uint32_t preprocessGroupCountX = (paddedCount + 255) / 256;
         commandBuffer->dispatch(preprocessGroupCountX, 1, 1);
         std::cout << "[System] Dispatched " << preprocessGroupCountX << " workgroups for preprocess." << std::endl;
+
+        // (i) Barrier: Preprocess writes must be visible before rasterize reads
+        vk::MemoryBarrier rasterizeBarrier(
+            vk::AccessFlagBits::eShaderWrite,
+            vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite
+        );
+        commandBuffer->pipelineBarrier(
+            vk::PipelineStageFlagBits::eComputeShader,
+            vk::PipelineStageFlagBits::eComputeShader,
+            vk::DependencyFlags(),
+            1, &rasterizeBarrier,
+            0, nullptr,
+            0, nullptr
+        );
+
+        // (j) Rasterize: Pure Compute Rasterization
+        commandBuffer->bindPipeline(vk::PipelineBindPoint::eCompute, *rasterizePipeline);
+        uint32_t rasterizePC[3] = {paddedCount, WIDTH, HEIGHT};
+        commandBuffer->pushConstants<uint32_t>(*pipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, rasterizePC);
+        uint32_t rasterizeGroupCountX = (WIDTH + 15) / 16;
+        uint32_t rasterizeGroupCountY = (HEIGHT + 15) / 16;
+        commandBuffer->dispatch(rasterizeGroupCountX, rasterizeGroupCountY, 1);
+        std::cout << "[System] Dispatched " << rasterizeGroupCountX << "x" << rasterizeGroupCountY 
+                  << " workgroups for rasterization (" << WIDTH << "x" << HEIGHT << ")." << std::endl;
 
         commandBuffer->end();
 
@@ -917,6 +1017,64 @@ int main() {
         gaussian2DReadbackBuffer.unmap();
 
         std::cout << "[System] VERIFICATION SUCCESS: 3D to 2D covariance projection complete." << std::endl;
+
+        // 19. Reverse DMA: Readback ImageBuffer for PPM output
+        VmaBuffer readbackImageBuffer(
+            vulkanDevice.getAllocator(),
+            imageBufferSize,
+            vk::BufferUsageFlagBits::eTransferDst,
+            VMA_MEMORY_USAGE_GPU_TO_CPU
+        );
+
+        vk::CommandBufferAllocateInfo imgReadbackCmdBufInfo(
+            *commandPool,
+            vk::CommandBufferLevel::ePrimary,
+            1
+        );
+        auto imgReadbackCmdBuffers = vulkanDevice.getDevice().allocateCommandBuffersUnique(imgReadbackCmdBufInfo);
+        auto& imgReadbackCmdBuffer = imgReadbackCmdBuffers[0];
+
+        vk::CommandBufferBeginInfo imgReadbackBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
+        imgReadbackCmdBuffer->begin(imgReadbackBeginInfo);
+
+        vk::BufferCopy imgReadbackCopyRegion(0, 0, imageBufferSize);
+        imgReadbackCmdBuffer->copyBuffer(
+            imageBuffer.getBuffer(),
+            readbackImageBuffer.getBuffer(),
+            imgReadbackCopyRegion
+        );
+
+        imgReadbackCmdBuffer->end();
+
+        vk::SubmitInfo imgReadbackSubmitInfo(
+            0, nullptr, nullptr,
+            1, &*imgReadbackCmdBuffer,
+            0, nullptr
+        );
+
+        VK_CHECK(vulkanDevice.getComputeQueue().submit(1, &imgReadbackSubmitInfo, nullptr));
+        vulkanDevice.getComputeQueue().waitIdle();
+
+        // 20. Write PPM file
+        float* imageData = static_cast<float*>(readbackImageBuffer.map());
+
+        std::ofstream ppmFile("output.ppm");
+        ppmFile << "P3\n" << WIDTH << " " << HEIGHT << "\n255\n";
+
+        for (uint32_t y = 0; y < HEIGHT; ++y) {
+            for (uint32_t x = 0; x < WIDTH; ++x) {
+                uint32_t idx = (y * WIDTH + x) * 4;
+                int r = static_cast<int>(std::clamp(imageData[idx + 0] * 255.0f, 0.0f, 255.0f));
+                int g = static_cast<int>(std::clamp(imageData[idx + 1] * 255.0f, 0.0f, 255.0f));
+                int b = static_cast<int>(std::clamp(imageData[idx + 2] * 255.0f, 0.0f, 255.0f));
+                ppmFile << r << " " << g << " " << b << "\n";
+            }
+        }
+
+        ppmFile.close();
+        readbackImageBuffer.unmap();
+
+        std::cout << "[System] RENDER SUCCESS: Image saved to output.ppm." << std::endl;
 
     } catch (const std::exception& e) {
         std::cerr << "Critical Error: " << e.what() << std::endl;

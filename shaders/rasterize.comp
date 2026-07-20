@@ -1,0 +1,53 @@
+#version 460
+layout(local_size_x = 16, local_size_y = 16) in;
+
+struct Gaussian2D {
+    vec2 pos2D;
+    float depth;
+    float opacity;
+    vec3 conic;
+    float pad1;
+    vec3 color;
+    float pad2;
+};
+
+layout(std430, binding = 3) readonly buffer Gaussian2DBuffer {
+    Gaussian2D gaussians2D[];
+};
+
+layout(std430, binding = 4) buffer ImageBuffer {
+    vec4 pixels[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint gaussianCount;
+    uint width;
+    uint height;
+} pc;
+
+void main() {
+    uvec2 pixel = gl_GlobalInvocationID.xy;
+
+    if (pixel.x >= pc.width || pixel.y >= pc.height) return;
+
+    vec3 finalColor = vec3(0.0);
+
+    for (uint i = 0; i < pc.gaussianCount; i++) {
+        Gaussian2D g = gaussians2D[i];
+
+        vec2 d = vec2(pixel) - g.pos2D;
+
+        float power = -0.5 * (g.conic.x * d.x * d.x + g.conic.z * d.y * d.y + 2.0 * g.conic.y * d.x * d.y);
+
+        if (power > 0.0) continue;
+
+        float alpha = min(0.99, g.opacity * exp(power));
+
+        if (alpha < 1.0 / 255.0) continue;
+
+        finalColor = mix(finalColor, g.color, alpha);
+    }
+
+    uint idx = pixel.y * pc.width + pixel.x;
+    pixels[idx] = vec4(finalColor, 1.0);
+}
