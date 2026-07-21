@@ -97,7 +97,13 @@ void main() {
 
     // 4. Build 3D rotation matrix and extract uniform scale
     mat3 R = buildRotationMatrix(gp.rot);
-    float s = gp.scale;
+    // float s = gp.scale;
+
+    // shrunk by 20 to prevent the test data from being too large and filling the screen.
+    float s = gp.scale * 0.05; 
+
+    // forced them to be red to eliminate the interference if NPY is gray.
+    gp.color = vec3(1.0, 0.2, 0.2); 
 
     // 5. Compute the Jacobian of the full viewProj -> screen transformation
     //    This directly computes T = J * W (projection Jacobian * view rotation)

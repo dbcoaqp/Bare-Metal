@@ -22,6 +22,7 @@
 #include "core/Camera.h"
 #include "utils/NpyParser.h"
 #include "core/Gaussian2D.h"
+#include "core/MathUtils.h"
 
 // Global function pointer table memory allocation
 VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE;
@@ -343,8 +344,9 @@ int main() {
         // 6. Create Camera Uniform Buffer with fake data
         CameraUniform cameraData{};
         // Identity viewProj matrix (column-major)
-        cameraData.viewProj[0] = 1.0f; cameraData.viewProj[5] = 1.0f;
-        cameraData.viewProj[10] = 1.0f; cameraData.viewProj[15] = 1.0f;
+        //cameraData.viewProj[0] = 1.0f; cameraData.viewProj[5] = 1.0f;
+        //cameraData.viewProj[10] = 1.0f; cameraData.viewProj[15] = 1.0f;
+        MathUtils::buildViewProjection(cameraData.viewProj, 0.0f, 0.0f, -5.0f, WIDTH, HEIGHT);
         // Camera position at (0, 0, -5)
         cameraData.cameraPosition[0] = 0.0f;
         cameraData.cameraPosition[1] = 0.0f;
