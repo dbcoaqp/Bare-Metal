@@ -863,7 +863,7 @@ int main() {
 
         // (j) Rasterize: Pure Compute Rasterization
         commandBuffer->bindPipeline(vk::PipelineBindPoint::eCompute, *rasterizePipeline);
-        uint32_t rasterizePC[3] = {paddedCount, WIDTH, HEIGHT};
+        uint32_t rasterizePC[3] = {static_cast<uint32_t>(pointData.size()), WIDTH, HEIGHT};
         commandBuffer->pushConstants<uint32_t>(*pipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, rasterizePC);
         uint32_t rasterizeGroupCountX = (WIDTH + 15) / 16;
         uint32_t rasterizeGroupCountY = (HEIGHT + 15) / 16;
