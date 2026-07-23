@@ -15,6 +15,9 @@
 #include <algorithm>
 #include <fstream>
 
+#define GLFW_INCLUDE_VULKAN
+#include <GLFW/glfw3.h>
+
 #include "utils/FileIO.h"
 #include "utils/VkCheck.h"
 #include "core/VmaBuffer.h"
@@ -27,8 +30,65 @@
 // Global function pointer table memory allocation
 VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE;
 
+class GlfwGuard {
+public:
+    GlfwGuard() {
+        if (!glfwInit()) {
+            throw std::runtime_error("Fatal: Failed to initialize GLFW.");
+        }
+        glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+        std::cout << "[System] GLFW initialized." << std::endl;
+    }
+    ~GlfwGuard() { glfwTerminate(); }
+    GlfwGuard(const GlfwGuard&) = delete;
+    GlfwGuard& operator=(const GlfwGuard&) = delete;
+};
+
+class GlfwWindow {
+public:
+    GlfwWindow(uint32_t width, uint32_t height, const char* title) {
+        m_window = glfwCreateWindow(width, height, title, nullptr, nullptr);
+        if (!m_window) {
+            throw std::runtime_error("Fatal: Failed to create GLFW window.");
+        }
+        std::cout << "[System] GLFW window created (" << width << "x" << height << ")." << std::endl;
+    }
+    ~GlfwWindow() { if (m_window) glfwDestroyWindow(m_window); }
+    GlfwWindow(const GlfwWindow&) = delete;
+    GlfwWindow& operator=(const GlfwWindow&) = delete;
+    GLFWwindow* get() const { return m_window; }
+private:
+    GLFWwindow* m_window = nullptr;
+};
+
+class WindowSurface {
+public:
+    WindowSurface(vk::Instance instance, GLFWwindow* window) : m_instance(instance) {
+        VkSurfaceKHR rawSurface;
+        VkResult result = glfwCreateWindowSurface(
+            static_cast<VkInstance>(instance), window, nullptr, &rawSurface);
+        if (result != VK_SUCCESS) {
+            throw std::runtime_error("Fatal: Failed to create window surface.");
+        }
+        m_surface = static_cast<vk::SurfaceKHR>(rawSurface);
+        std::cout << "[System] Window Surface created." << std::endl;
+    }
+    ~WindowSurface() {
+        if (m_surface) {
+            m_instance.destroySurfaceKHR(m_surface);
+        }
+    }
+    WindowSurface(const WindowSurface&) = delete;
+    WindowSurface& operator=(const WindowSurface&) = delete;
+    vk::SurfaceKHR get() const { return m_surface; }
+private:
+    vk::Instance m_instance;
+    vk::SurfaceKHR m_surface = nullptr;
+};
+
 struct QueueFamilyIndices {
     std::optional<uint32_t> computeFamily;
+    std::optional<uint32_t> presentFamily;
 };
 
 struct TargetDevice {
@@ -38,7 +98,7 @@ struct TargetDevice {
 
 class DeviceSelector {
 public:
-    static TargetDevice selectOptimalDevice(const vk::Instance& instance) {
+    static TargetDevice selectOptimalDevice(const vk::Instance& instance, vk::SurfaceKHR surface) {
         std::vector<vk::PhysicalDevice> devices = instance.enumeratePhysicalDevices();
         if (devices.empty()) {
             throw std::runtime_error("Fatal: No Vulkan supported GPU.");
@@ -47,7 +107,7 @@ public:
         std::multimap<int, TargetDevice> candidates;
 
         for (const auto& device : devices) {
-            auto [score, indices] = evaluateDevice(device);
+            auto [score, indices] = evaluateDevice(device, surface);
             if (score > 0) {
                 candidates.insert({score, TargetDevice{device, indices}});
             }
@@ -67,7 +127,7 @@ public:
     }
 
 private:
-    static std::pair<int, QueueFamilyIndices> evaluateDevice(const vk::PhysicalDevice& device) {
+    static std::pair<int, QueueFamilyIndices> evaluateDevice(const vk::PhysicalDevice& device, vk::SurfaceKHR surface) {
         int score = 0;
         QueueFamilyIndices indices{};
         vk::PhysicalDeviceProperties properties = device.getProperties();
@@ -86,6 +146,16 @@ private:
             }
         }
         if (!indices.computeFamily.has_value()) {
+            return {0, indices};
+        }
+
+        // 2b. Check if compute queue also supports present on this surface
+        vk::Bool32 presentSupport = device.getSurfaceSupportKHR(
+            indices.computeFamily.value(), surface);
+        if (presentSupport) {
+            indices.presentFamily = indices.computeFamily.value();
+        }
+        if (!indices.presentFamily.has_value()) {
             return {0, indices};
         }
 
@@ -122,10 +192,17 @@ public:
         vk::PhysicalDeviceVulkan13Features vulkan13Features{};
         vulkan13Features.synchronization2 = VK_TRUE;
 
+        const std::vector<const char*> deviceExtensions = {
+            VK_KHR_SWAPCHAIN_EXTENSION_NAME
+        };
+
         vk::DeviceCreateInfo deviceCreateInfo(
             vk::DeviceCreateFlags(),
             1,
-            &queueCreateInfo
+            &queueCreateInfo,
+            0, nullptr,
+            static_cast<uint32_t>(deviceExtensions.size()),
+            deviceExtensions.data()
         );
         deviceCreateInfo.pNext = &vulkan13Features;
 
@@ -206,7 +283,7 @@ public:
         
         VULKAN_HPP_DEFAULT_DISPATCHER.init(vkGetInstanceProcAddr);
 
-        vk::ApplicationInfo appInfo("Vulkan Compute Probe", 1, "Bare Metal", 1, VK_API_VERSION_1_3);
+        vk::ApplicationInfo appInfo("Bare Metal 3DGS", 1, "Bare Metal", 1, VK_API_VERSION_1_3);
 
         const std::vector<const char*> validationLayers = {
             "VK_LAYER_KHRONOS_validation"
@@ -226,14 +303,29 @@ public:
             }
         }
 
-        vk::InstanceCreateInfo createInfo({}, &appInfo, validationLayers, {});
+        // Get GLFW required Vulkan extensions (includes VK_KHR_surface + platform extension)
+        uint32_t glfwExtensionCount = 0;
+        const char** glfwExtensions = glfwGetRequiredInstanceExtensions(&glfwExtensionCount);
+        if (!glfwExtensions) {
+            throw std::runtime_error("Fatal: GLFW requires Vulkan surface extensions that are not available.");
+        }
+
+        std::vector<const char*> extensions(glfwExtensions, glfwExtensions + glfwExtensionCount);
+        std::cout << "[System] GLFW required " << glfwExtensionCount << " Vulkan instance extension(s):" << std::endl;
+        for (uint32_t i = 0; i < glfwExtensionCount; ++i) {
+            std::cout << "  - " << glfwExtensions[i] << std::endl;
+        }
+
+        vk::InstanceCreateInfo createInfo({}, &appInfo, validationLayers, extensions);
 
         instance = vk::createInstanceUnique(createInfo);
 
         VULKAN_HPP_DEFAULT_DISPATCHER.init(instance.get());
     }
 
-    ~VulkanInstance() = default;
+    ~VulkanInstance() {
+        instance.reset();
+    }
 
     vk::Instance get() const { return *instance; }
 
@@ -244,33 +336,112 @@ private:
 
 int main() {
     try {
+        // ===== GLFW Initialization (before Vulkan instance) =====
+        GlfwGuard glfwGuard;
+
         std::cout << "--- Bare Metal Boot Sequence Initiated ---" << std::endl;
         
+        uint32_t WIDTH = 1024;
+        uint32_t HEIGHT = 768;
+
         VulkanInstance vkInstance;
         std::cout << "[System] Vulkan Instance initialized (Dynamic Dispatch Active)." << std::endl;
 
-        TargetDevice target = DeviceSelector::selectOptimalDevice(vkInstance.get());
+        // ===== Phase 9: Create GLFW Window & Surface =====
+        GlfwWindow window(WIDTH, HEIGHT, "Bare Metal 3DGS");
+        WindowSurface surface(vkInstance.get(), window.get());
+
+        TargetDevice target = DeviceSelector::selectOptimalDevice(vkInstance.get(), surface.get());
 
         VulkanDevice vulkanDevice(vkInstance.get(), target);
         std::cout << "[System] Logical Device and Compute Queue successfully engaged." << std::endl;
         std::cout << "[System] VMA Allocator successfully engaged." << std::endl;
         std::cout << "--- Bare Metal Boot Sequence Completed ---" << std::endl;
 
-        // Phase 6: GPU Sorting - Stage 1: Depth Key-Value Generation
-        
-        // 1. Read shader binary (path injected by CMake at build-time)
+        // ===== Phase 9: Build Swapchain =====
+        auto surfaceCapabilities = target.physical.getSurfaceCapabilitiesKHR(surface.get());
+        auto surfaceFormats = target.physical.getSurfaceFormatsKHR(surface.get());
+        auto surfacePresentModes = target.physical.getSurfacePresentModesKHR(surface.get());
+
+        // Choose format: prefer eB8G8R8A8Unorm + eSrgbNonlinear
+        vk::SurfaceFormatKHR chosenFormat = surfaceFormats[0];
+        for (const auto& fmt : surfaceFormats) {
+            if (fmt.format == vk::Format::eB8G8R8A8Unorm &&
+                fmt.colorSpace == vk::ColorSpaceKHR::eSrgbNonlinear) {
+                chosenFormat = fmt;
+                break;
+            }
+        }
+        std::cout << "[System] Swapchain format: " << vk::to_string(chosenFormat.format) << std::endl;
+
+        // Choose present mode: prefer eMailbox, fallback to eFifo (guaranteed)
+        vk::PresentModeKHR chosenPresentMode = vk::PresentModeKHR::eFifo;
+        for (const auto& mode : surfacePresentModes) {
+            if (mode == vk::PresentModeKHR::eMailbox) {
+                chosenPresentMode = mode;
+                break;
+            }
+        }
+        std::cout << "[System] Swapchain present mode: " << vk::to_string(chosenPresentMode) << std::endl;
+
+        // Choose extent
+        vk::Extent2D swapchainExtent;
+        if (surfaceCapabilities.currentExtent.width != UINT32_MAX) {
+            swapchainExtent = surfaceCapabilities.currentExtent;
+        } else {
+            swapchainExtent.width = std::clamp(WIDTH,
+                surfaceCapabilities.minImageExtent.width, surfaceCapabilities.maxImageExtent.width);
+            swapchainExtent.height = std::clamp(HEIGHT,
+                surfaceCapabilities.minImageExtent.height, surfaceCapabilities.maxImageExtent.height);
+        }
+        WIDTH = swapchainExtent.width;
+        HEIGHT = swapchainExtent.height;
+        std::cout << "[System] Swapchain extent: " << WIDTH << "x" << HEIGHT << std::endl;
+
+        // Choose image count (prefer triple buffering)
+        uint32_t minImageCount = surfaceCapabilities.minImageCount + 1;
+        if (surfaceCapabilities.maxImageCount > 0 && minImageCount > surfaceCapabilities.maxImageCount) {
+            minImageCount = surfaceCapabilities.maxImageCount;
+        }
+
+        vk::SwapchainCreateInfoKHR swapchainCreateInfo(
+            vk::SwapchainCreateFlagsKHR(),
+            surface.get(),
+            minImageCount,
+            chosenFormat.format,
+            chosenFormat.colorSpace,
+            swapchainExtent,
+            1,                                          // imageArrayLayers
+            vk::ImageUsageFlagBits::eTransferDst,       // Compute result copies TO this image
+            vk::SharingMode::eExclusive,
+            0, nullptr,
+            surfaceCapabilities.currentTransform,
+            vk::CompositeAlphaFlagBitsKHR::eOpaque,
+            chosenPresentMode,
+            VK_TRUE,                                    // clipped
+            nullptr                                     // oldSwapchain
+        );
+
+        auto swapchain = vulkanDevice.getDevice().createSwapchainKHRUnique(swapchainCreateInfo);
+        std::cout << "[System] Swapchain created (" << minImageCount << " images)." << std::endl;
+
+        auto swapchainImages = vulkanDevice.getDevice().getSwapchainImagesKHR(*swapchain);
+        std::cout << "[System] Retrieved " << swapchainImages.size() << " swapchain images." << std::endl;
+
+        // ===== Compute Pipeline Setup =====
+
+        // 1. Read shader binary
         std::string shaderPath = std::string(SHADER_DIR) + "/calc_depth.spv";
         auto shaderCode = FileIO::readFile(shaderPath);
         std::cout << "[System] Shader loaded: " << shaderCode.size() << " bytes." << std::endl;
 
-        // 2. Parse Gaussian points from .npy file
+        // 2. Parse Gaussian points
         std::string npyPath = std::string(SHADER_DIR) + "/test.npy";
         auto pointData = NpyParser::parse(npyPath);
         vk::DeviceSize gaussianBufferSize = pointData.size() * sizeof(GaussianPoint);
         std::cout << "[System] Loaded " << pointData.size() << " Gaussian points (" 
                   << gaussianBufferSize << " bytes)." << std::endl;
 
-        // Calculate the smallest power-of-two >= pointData.size() for bitonic sort
         uint32_t paddedCount = 1;
         while (paddedCount < pointData.size()) {
             paddedCount <<= 1;
@@ -278,10 +449,7 @@ int main() {
         std::cout << "[System] Bitonic sort padded count: " << paddedCount 
                   << " (original: " << pointData.size() << ")." << std::endl;
 
-        uint32_t WIDTH = 1024;
-        uint32_t HEIGHT = 768;
-
-        // 3. Create staging buffer and upload Gaussian data to GPU
+        // 3. Staging buffer and DMA transfer
         VmaBuffer stagingBuffer(
             vulkanDevice.getAllocator(),
             gaussianBufferSize,
@@ -302,15 +470,15 @@ int main() {
             VMA_MEMORY_USAGE_GPU_ONLY
         );
 
-        // 4. Create command pool
+        // 4. Command pool (with reset flag for per-frame recording)
         vk::CommandPoolCreateInfo commandPoolCreateInfo(
-            vk::CommandPoolCreateFlags(),
+            vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
             target.indices.computeFamily.value()
         );
 
         auto commandPool = vulkanDevice.getDevice().createCommandPoolUnique(commandPoolCreateInfo);
 
-        // 5. DMA transfer Gaussian data to GPU
+        // 5. DMA transfer
         vk::CommandBufferAllocateInfo tempCmdBufInfo(
             *commandPool,
             vk::CommandBufferLevel::ePrimary,
@@ -323,49 +491,32 @@ int main() {
         tempCmdBuffer->begin(tempBeginInfo);
 
         vk::BufferCopy copyRegion(0, 0, gaussianBufferSize);
-        tempCmdBuffer->copyBuffer(
-            stagingBuffer.getBuffer(),
-            gaussianBuffer.getBuffer(),
-            copyRegion
-        );
+        tempCmdBuffer->copyBuffer(stagingBuffer.getBuffer(), gaussianBuffer.getBuffer(), copyRegion);
 
         tempCmdBuffer->end();
 
-        vk::SubmitInfo tempSubmitInfo(
-            0, nullptr, nullptr,
-            1, &*tempCmdBuffer,
-            0, nullptr
-        );
-
+        vk::SubmitInfo tempSubmitInfo(0, nullptr, nullptr, 1, &*tempCmdBuffer, 0, nullptr);
         VK_CHECK(vulkanDevice.getComputeQueue().submit(1, &tempSubmitInfo, nullptr));
         vulkanDevice.getComputeQueue().waitIdle();
         std::cout << "[System] DMA Transfer Complete: Gaussian data injected into Device Local VRAM." << std::endl;
 
-        // 6. Create Camera Uniform Buffer with fake data
+        // 6. Camera buffer
         CameraUniform cameraData{};
-        // Identity viewProj matrix (column-major)
-        //cameraData.viewProj[0] = 1.0f; cameraData.viewProj[5] = 1.0f;
-        //cameraData.viewProj[10] = 1.0f; cameraData.viewProj[15] = 1.0f;
         MathUtils::buildViewProjection(cameraData.viewProj, 0.0f, 0.0f, -5.0f, WIDTH, HEIGHT);
-        // Camera position at (0, 0, -5)
         cameraData.cameraPosition[0] = 0.0f;
         cameraData.cameraPosition[1] = 0.0f;
         cameraData.cameraPosition[2] = -5.0f;
-        cameraData.cameraPosition[3] = 0.0f; // pad
-
-        // Camera looking forward along +Z axis
+        cameraData.cameraPosition[3] = 0.0f;
         cameraData.cameraForward[0] = 0.0f;
         cameraData.cameraForward[1] = 0.0f;
         cameraData.cameraForward[2] = 1.0f;
-        cameraData.cameraForward[3] = 0.0f; // pad
-
-        // Camera intrinsics for Jacobian computation
+        cameraData.cameraForward[3] = 0.0f;
         cameraData.focal_x = 1000.0f;
         cameraData.focal_y = 1000.0f;
         cameraData.tan_fovx = 0.5f;
         cameraData.tan_fovy = 0.5f;
-        cameraData.viewport[0] = 1024.0f;
-        cameraData.viewport[1] = 768.0f;
+        cameraData.viewport[0] = static_cast<float>(WIDTH);
+        cameraData.viewport[1] = static_cast<float>(HEIGHT);
         cameraData.pad_cam[0] = 0.0f;
         cameraData.pad_cam[1] = 0.0f;
 
@@ -380,9 +531,9 @@ int main() {
         std::memcpy(cameraMapped, &cameraData, sizeof(CameraUniform));
         cameraBuffer.flush();
         cameraBuffer.unmap();
-        std::cout << "[System] Camera buffer created with position (0, 0, -5) and forward (0, 0, 1)." << std::endl;
+        std::cout << "[System] Camera buffer created." << std::endl;
 
-        // 7. Create Sort Key Buffer (padded to power-of-two for bitonic sort)
+        // 7. Sort key buffer
         vk::DeviceSize sortKeyBufferSize = static_cast<vk::DeviceSize>(paddedCount) * sizeof(SortKeyPair);
         VmaBuffer sortKeyBuffer(
             vulkanDevice.getAllocator(),
@@ -390,9 +541,9 @@ int main() {
             vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eTransferSrc,
             VMA_MEMORY_USAGE_GPU_ONLY
         );
-        std::cout << "[System] Sort key buffer created (" << sortKeyBufferSize << " bytes, padded for bitonic sort)." << std::endl;
+        std::cout << "[System] Sort key buffer created (" << sortKeyBufferSize << " bytes)." << std::endl;
 
-        // 7b. Create Gaussian2D Output Buffer
+        // 7b. Gaussian2D buffer
         vk::DeviceSize gaussian2DBufferSize = static_cast<vk::DeviceSize>(paddedCount) * sizeof(Gaussian2D);
         VmaBuffer gaussian2DBuffer(
             vulkanDevice.getAllocator(),
@@ -402,62 +553,31 @@ int main() {
         );
         std::cout << "[System] Gaussian2D buffer created (" << gaussian2DBufferSize << " bytes)." << std::endl;
 
-        // 7c. Create Image Buffer for rasterization output
-        vk::DeviceSize imageBufferSize = static_cast<vk::DeviceSize>(WIDTH) * HEIGHT * sizeof(float) * 4;
+        // 7c. Image buffer (uint32_t per pixel = packed BGRA8)
+        vk::DeviceSize imageBufferSize = static_cast<vk::DeviceSize>(WIDTH) * HEIGHT * sizeof(uint32_t);
         VmaBuffer imageBuffer(
             vulkanDevice.getAllocator(),
             imageBufferSize,
             vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc,
             VMA_MEMORY_USAGE_GPU_ONLY
         );
-        std::cout << "[System] Image buffer created (" << imageBufferSize << " bytes, " << WIDTH << "x" << HEIGHT << " RGBA)." << std::endl;
+        std::cout << "[System] Image buffer created (" << imageBufferSize << " bytes, " << WIDTH << "x" << HEIGHT << " BGRA8)." << std::endl;
 
-        // 8. Create Shader Module
+        // 8. Shader module
         vk::ShaderModuleCreateInfo shaderModuleCreateInfo(
             vk::ShaderModuleCreateFlags(),
             shaderCode.size(),
             reinterpret_cast<const uint32_t*>(shaderCode.data())
         );
         auto shaderModule = vulkanDevice.getDevice().createShaderModuleUnique(shaderModuleCreateInfo);
-        std::cout << "[System] Compute Shader Module compiled." << std::endl;
 
-        // 9. Create Descriptor Set Layout (5 bindings)
+        // 9. Descriptor set layout
         std::vector<vk::DescriptorSetLayoutBinding> layoutBindings = {
-            // binding 0: GaussianBuffer (SSBO, read-only)
-            vk::DescriptorSetLayoutBinding(
-                0,
-                vk::DescriptorType::eStorageBuffer,
-                1,
-                vk::ShaderStageFlagBits::eCompute
-            ),
-            // binding 1: SortKeyBuffer (SSBO)
-            vk::DescriptorSetLayoutBinding(
-                1,
-                vk::DescriptorType::eStorageBuffer,
-                1,
-                vk::ShaderStageFlagBits::eCompute
-            ),
-            // binding 2: CameraBuffer (UBO)
-            vk::DescriptorSetLayoutBinding(
-                2,
-                vk::DescriptorType::eUniformBuffer,
-                1,
-                vk::ShaderStageFlagBits::eCompute
-            ),
-            // binding 3: Gaussian2DBuffer (SSBO, output)
-            vk::DescriptorSetLayoutBinding(
-                3,
-                vk::DescriptorType::eStorageBuffer,
-                1,
-                vk::ShaderStageFlagBits::eCompute
-            ),
-            // binding 4: ImageBuffer (SSBO, rasterization output)
-            vk::DescriptorSetLayoutBinding(
-                4,
-                vk::DescriptorType::eStorageBuffer,
-                1,
-                vk::ShaderStageFlagBits::eCompute
-            )
+            vk::DescriptorSetLayoutBinding(0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute),
+            vk::DescriptorSetLayoutBinding(1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute),
+            vk::DescriptorSetLayoutBinding(2, vk::DescriptorType::eUniformBuffer, 1, vk::ShaderStageFlagBits::eCompute),
+            vk::DescriptorSetLayoutBinding(3, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute),
+            vk::DescriptorSetLayoutBinding(4, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute)
         };
 
         vk::DescriptorSetLayoutCreateInfo layoutCreateInfo(
@@ -468,7 +588,7 @@ int main() {
 
         auto descriptorSetLayout = vulkanDevice.getDevice().createDescriptorSetLayoutUnique(layoutCreateInfo);
 
-        // 10. Create Descriptor Pool
+        // 10. Descriptor pool
         std::vector<vk::DescriptorPoolSize> poolSizes = {
             vk::DescriptorPoolSize(vk::DescriptorType::eStorageBuffer, 4),
             vk::DescriptorPoolSize(vk::DescriptorType::eUniformBuffer, 1)
@@ -476,18 +596,18 @@ int main() {
 
         vk::DescriptorPoolCreateInfo poolCreateInfo(
             vk::DescriptorPoolCreateFlags(),
-            1,  // maxSets
+            1,
             static_cast<uint32_t>(poolSizes.size()),
             poolSizes.data()
         );
 
         auto descriptorPool = vulkanDevice.getDevice().createDescriptorPoolUnique(poolCreateInfo);
 
-        // 11. Create Pipeline Layout (with push constants for bitonic sort and rasterize)
+        // 11. Pipeline layout (push constants: 3 x uint32_t = 12 bytes for rasterize)
         vk::PushConstantRange pushConstantRange(
             vk::ShaderStageFlagBits::eCompute,
             0,
-            sizeof(uint32_t) * 3  // k, j (bitonic) and gaussianCount, width, height (rasterize)
+            sizeof(uint32_t) * 3
         );
 
         vk::PipelineLayoutCreateInfo pipelineLayoutCreateInfo(
@@ -500,7 +620,7 @@ int main() {
 
         auto pipelineLayout = vulkanDevice.getDevice().createPipelineLayoutUnique(pipelineLayoutCreateInfo);
 
-        // 12. Create Compute Pipeline (calc_depth)
+        // 12a. calc_depth pipeline
         vk::PipelineShaderStageCreateInfo stageCreateInfo(
             vk::PipelineShaderStageCreateFlags(),
             vk::ShaderStageFlagBits::eCompute,
@@ -514,569 +634,259 @@ int main() {
             *pipelineLayout
         );
 
-        auto computePipelineResult = vulkanDevice.getDevice().createComputePipelineUnique(
-            nullptr,
-            computePipelineCreateInfo
-        );
-
+        auto computePipelineResult = vulkanDevice.getDevice().createComputePipelineUnique(nullptr, computePipelineCreateInfo);
         if (computePipelineResult.result != vk::Result::eSuccess) {
             throw std::runtime_error("Fatal: Failed to create compute pipeline.");
         }
-
         auto computePipeline = std::move(computePipelineResult.value);
 
-        // 12b. Load Bitonic Sort Shader and Create Sort Pipeline
+        // 12b. bitonic_sort pipeline
         std::string bitonicShaderPath = std::string(SHADER_DIR) + "/bitonic_sort.spv";
         auto bitonicShaderCode = FileIO::readFile(bitonicShaderPath);
-        std::cout << "[System] Bitonic sort shader loaded: " << bitonicShaderCode.size() << " bytes." << std::endl;
 
-        vk::ShaderModuleCreateInfo bitonicShaderModuleCreateInfo(
-            vk::ShaderModuleCreateFlags(),
-            bitonicShaderCode.size(),
-            reinterpret_cast<const uint32_t*>(bitonicShaderCode.data())
-        );
-        auto bitonicShaderModule = vulkanDevice.getDevice().createShaderModuleUnique(bitonicShaderModuleCreateInfo);
+        vk::ShaderModuleCreateInfo bitonicSMCI(vk::ShaderModuleCreateFlags(), bitonicShaderCode.size(),
+            reinterpret_cast<const uint32_t*>(bitonicShaderCode.data()));
+        auto bitonicShaderModule = vulkanDevice.getDevice().createShaderModuleUnique(bitonicSMCI);
 
-        vk::PipelineShaderStageCreateInfo bitonicStageCreateInfo(
-            vk::PipelineShaderStageCreateFlags(),
-            vk::ShaderStageFlagBits::eCompute,
-            *bitonicShaderModule,
-            "main"
-        );
+        vk::PipelineShaderStageCreateInfo bitonicStageCI(
+            vk::PipelineShaderStageCreateFlags(), vk::ShaderStageFlagBits::eCompute, *bitonicShaderModule, "main");
+        vk::ComputePipelineCreateInfo bitonicPipelineCI(vk::PipelineCreateFlags(), bitonicStageCI, *pipelineLayout);
 
-        vk::ComputePipelineCreateInfo bitonicPipelineCreateInfo(
-            vk::PipelineCreateFlags(),
-            bitonicStageCreateInfo,
-            *pipelineLayout  // Reuse the same pipeline layout
-        );
-
-        auto bitonicPipelineResult = vulkanDevice.getDevice().createComputePipelineUnique(
-            nullptr,
-            bitonicPipelineCreateInfo
-        );
-
+        auto bitonicPipelineResult = vulkanDevice.getDevice().createComputePipelineUnique(nullptr, bitonicPipelineCI);
         if (bitonicPipelineResult.result != vk::Result::eSuccess) {
             throw std::runtime_error("Fatal: Failed to create bitonic sort compute pipeline.");
         }
-
         auto sortPipeline = std::move(bitonicPipelineResult.value);
         std::cout << "[System] Bitonic sort pipeline created." << std::endl;
 
-        // 12c. Load Preprocess Shader and Create Preprocess Pipeline
+        // 12c. preprocess pipeline
         std::string preprocessShaderPath = std::string(SHADER_DIR) + "/preprocess.spv";
         auto preprocessShaderCode = FileIO::readFile(preprocessShaderPath);
-        std::cout << "[System] Preprocess shader loaded: " << preprocessShaderCode.size() << " bytes." << std::endl;
 
-        vk::ShaderModuleCreateInfo preprocessShaderModuleCreateInfo(
-            vk::ShaderModuleCreateFlags(),
-            preprocessShaderCode.size(),
-            reinterpret_cast<const uint32_t*>(preprocessShaderCode.data())
-        );
-        auto preprocessShaderModule = vulkanDevice.getDevice().createShaderModuleUnique(preprocessShaderModuleCreateInfo);
+        vk::ShaderModuleCreateInfo preprocessSMCI(vk::ShaderModuleCreateFlags(), preprocessShaderCode.size(),
+            reinterpret_cast<const uint32_t*>(preprocessShaderCode.data()));
+        auto preprocessShaderModule = vulkanDevice.getDevice().createShaderModuleUnique(preprocessSMCI);
 
-        vk::PipelineShaderStageCreateInfo preprocessStageCreateInfo(
-            vk::PipelineShaderStageCreateFlags(),
-            vk::ShaderStageFlagBits::eCompute,
-            *preprocessShaderModule,
-            "main"
-        );
+        vk::PipelineShaderStageCreateInfo preprocessStageCI(
+            vk::PipelineShaderStageCreateFlags(), vk::ShaderStageFlagBits::eCompute, *preprocessShaderModule, "main");
+        vk::ComputePipelineCreateInfo preprocessPipelineCI(vk::PipelineCreateFlags(), preprocessStageCI, *pipelineLayout);
 
-        vk::ComputePipelineCreateInfo preprocessPipelineCreateInfo(
-            vk::PipelineCreateFlags(),
-            preprocessStageCreateInfo,
-            *pipelineLayout
-        );
-
-        auto preprocessPipelineResult = vulkanDevice.getDevice().createComputePipelineUnique(
-            nullptr,
-            preprocessPipelineCreateInfo
-        );
-
+        auto preprocessPipelineResult = vulkanDevice.getDevice().createComputePipelineUnique(nullptr, preprocessPipelineCI);
         if (preprocessPipelineResult.result != vk::Result::eSuccess) {
             throw std::runtime_error("Fatal: Failed to create preprocess compute pipeline.");
         }
-
         auto preprocessPipeline = std::move(preprocessPipelineResult.value);
         std::cout << "[System] Preprocess pipeline created." << std::endl;
 
-        // 12d. Load Rasterize Shader and Create Rasterize Pipeline
+        // 12d. rasterize pipeline
         std::string rasterizeShaderPath = std::string(SHADER_DIR) + "/rasterize.spv";
         auto rasterizeShaderCode = FileIO::readFile(rasterizeShaderPath);
-        std::cout << "[System] Rasterize shader loaded: " << rasterizeShaderCode.size() << " bytes." << std::endl;
 
-        vk::ShaderModuleCreateInfo rasterizeShaderModuleCreateInfo(
-            vk::ShaderModuleCreateFlags(),
-            rasterizeShaderCode.size(),
-            reinterpret_cast<const uint32_t*>(rasterizeShaderCode.data())
-        );
-        auto rasterizeShaderModule = vulkanDevice.getDevice().createShaderModuleUnique(rasterizeShaderModuleCreateInfo);
+        vk::ShaderModuleCreateInfo rasterizeSMCI(vk::ShaderModuleCreateFlags(), rasterizeShaderCode.size(),
+            reinterpret_cast<const uint32_t*>(rasterizeShaderCode.data()));
+        auto rasterizeShaderModule = vulkanDevice.getDevice().createShaderModuleUnique(rasterizeSMCI);
 
-        vk::PipelineShaderStageCreateInfo rasterizeStageCreateInfo(
-            vk::PipelineShaderStageCreateFlags(),
-            vk::ShaderStageFlagBits::eCompute,
-            *rasterizeShaderModule,
-            "main"
-        );
+        vk::PipelineShaderStageCreateInfo rasterizeStageCI(
+            vk::PipelineShaderStageCreateFlags(), vk::ShaderStageFlagBits::eCompute, *rasterizeShaderModule, "main");
+        vk::ComputePipelineCreateInfo rasterizePipelineCI(vk::PipelineCreateFlags(), rasterizeStageCI, *pipelineLayout);
 
-        vk::ComputePipelineCreateInfo rasterizePipelineCreateInfo(
-            vk::PipelineCreateFlags(),
-            rasterizeStageCreateInfo,
-            *pipelineLayout
-        );
-
-        auto rasterizePipelineResult = vulkanDevice.getDevice().createComputePipelineUnique(
-            nullptr,
-            rasterizePipelineCreateInfo
-        );
-
+        auto rasterizePipelineResult = vulkanDevice.getDevice().createComputePipelineUnique(nullptr, rasterizePipelineCI);
         if (rasterizePipelineResult.result != vk::Result::eSuccess) {
             throw std::runtime_error("Fatal: Failed to create rasterize compute pipeline.");
         }
-
         auto rasterizePipeline = std::move(rasterizePipelineResult.value);
         std::cout << "[System] Rasterize pipeline created." << std::endl;
 
-        // 13. Allocate and Update Descriptor Sets
-        vk::DescriptorSetAllocateInfo descriptorSetAllocateInfo(
-            *descriptorPool,
-            1,
-            &*descriptorSetLayout
-        );
-
+        // 13. Descriptor set
+        vk::DescriptorSetAllocateInfo descriptorSetAllocateInfo(*descriptorPool, 1, &*descriptorSetLayout);
         auto descriptorSets = vulkanDevice.getDevice().allocateDescriptorSets(descriptorSetAllocateInfo);
         auto descriptorSet = descriptorSets[0];
 
-        vk::DescriptorBufferInfo gaussianBufferInfo(
-            gaussianBuffer.getBuffer(),
-            0,
-            gaussianBufferSize
-        );
-
-        vk::DescriptorBufferInfo sortKeyBufferInfo(
-            sortKeyBuffer.getBuffer(),
-            0,
-            sortKeyBufferSize
-        );
-
-        vk::DescriptorBufferInfo cameraBufferInfo(
-            cameraBuffer.getBuffer(),
-            0,
-            sizeof(CameraUniform)
-        );
-
-        vk::DescriptorBufferInfo gaussian2DBufferInfo(
-            gaussian2DBuffer.getBuffer(),
-            0,
-            gaussian2DBufferSize
-        );
-
-        vk::DescriptorBufferInfo imageBufferInfo(
-            imageBuffer.getBuffer(),
-            0,
-            imageBufferSize
-        );
+        vk::DescriptorBufferInfo gaussianBufferInfo(gaussianBuffer.getBuffer(), 0, gaussianBufferSize);
+        vk::DescriptorBufferInfo sortKeyBufferInfo(sortKeyBuffer.getBuffer(), 0, sortKeyBufferSize);
+        vk::DescriptorBufferInfo cameraBufferInfo(cameraBuffer.getBuffer(), 0, sizeof(CameraUniform));
+        vk::DescriptorBufferInfo gaussian2DBufferInfo(gaussian2DBuffer.getBuffer(), 0, gaussian2DBufferSize);
+        vk::DescriptorBufferInfo imageBufferInfo(imageBuffer.getBuffer(), 0, imageBufferSize);
 
         std::vector<vk::WriteDescriptorSet> descriptorWrites = {
-            // binding 0: GaussianBuffer
-            vk::WriteDescriptorSet(
-                descriptorSet,
-                0,
-                0,
-                1,
-                vk::DescriptorType::eStorageBuffer,
-                nullptr,
-                &gaussianBufferInfo,
-                nullptr
-            ),
-            // binding 1: SortKeyBuffer
-            vk::WriteDescriptorSet(
-                descriptorSet,
-                1,
-                0,
-                1,
-                vk::DescriptorType::eStorageBuffer,
-                nullptr,
-                &sortKeyBufferInfo,
-                nullptr
-            ),
-            // binding 2: CameraBuffer
-            vk::WriteDescriptorSet(
-                descriptorSet,
-                2,
-                0,
-                1,
-                vk::DescriptorType::eUniformBuffer,
-                nullptr,
-                &cameraBufferInfo,
-                nullptr
-            ),
-            // binding 3: Gaussian2DBuffer
-            vk::WriteDescriptorSet(
-                descriptorSet,
-                3,
-                0,
-                1,
-                vk::DescriptorType::eStorageBuffer,
-                nullptr,
-                &gaussian2DBufferInfo,
-                nullptr
-            ),
-            // binding 4: ImageBuffer
-            vk::WriteDescriptorSet(
-                descriptorSet,
-                4,
-                0,
-                1,
-                vk::DescriptorType::eStorageBuffer,
-                nullptr,
-                &imageBufferInfo,
-                nullptr
-            )
+            vk::WriteDescriptorSet(descriptorSet, 0, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &gaussianBufferInfo, nullptr),
+            vk::WriteDescriptorSet(descriptorSet, 1, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &sortKeyBufferInfo, nullptr),
+            vk::WriteDescriptorSet(descriptorSet, 2, 0, 1, vk::DescriptorType::eUniformBuffer, nullptr, &cameraBufferInfo, nullptr),
+            vk::WriteDescriptorSet(descriptorSet, 3, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &gaussian2DBufferInfo, nullptr),
+            vk::WriteDescriptorSet(descriptorSet, 4, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &imageBufferInfo, nullptr)
         };
 
         vulkanDevice.getDevice().updateDescriptorSets(
-            static_cast<uint32_t>(descriptorWrites.size()),
-            descriptorWrites.data(),
-            0,
-            nullptr
-        );
+            static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data(), 0, nullptr);
 
-        // 14. Record and Dispatch Compute
-        vk::CommandBufferAllocateInfo commandBufferAllocateInfo(
-            *commandPool,
-            vk::CommandBufferLevel::ePrimary,
-            1
-        );
-
+        // 14. Command buffer
+        vk::CommandBufferAllocateInfo commandBufferAllocateInfo(*commandPool, vk::CommandBufferLevel::ePrimary, 1);
         auto commandBuffers = vulkanDevice.getDevice().allocateCommandBuffersUnique(commandBufferAllocateInfo);
         auto commandBuffer = std::move(commandBuffers[0]);
 
-        vk::CommandBufferBeginInfo beginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
-        commandBuffer->begin(beginInfo);
+        // Acquire fence for swapchain image acquisition
+        vk::FenceCreateInfo acquireFenceInfo(vk::FenceCreateFlagBits::eSignaled);
+        auto acquireFence = vulkanDevice.getDevice().createFenceUnique(acquireFenceInfo);
 
-        // (d) Pad the sort key buffer with -1.0f (0xBF800000) so padding elements sink to the end
-        commandBuffer->fillBuffer(sortKeyBuffer.getBuffer(), 0, VK_WHOLE_SIZE, 0xBF800000);
-        commandBuffer->fillBuffer(gaussian2DBuffer.getBuffer(), 0, VK_WHOLE_SIZE, 0);
+        std::cout << "[System] Entering render loop..." << std::endl;
 
-        // (e) Barrier: TransferWrite -> ShaderRead/Write (fillBuffer must complete before compute shaders)
-        vk::MemoryBarrier fillBarrier(
-            vk::AccessFlagBits::eTransferWrite,
-            vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite
-        );
-        commandBuffer->pipelineBarrier(
-            vk::PipelineStageFlagBits::eTransfer,
-            vk::PipelineStageFlagBits::eComputeShader,
-            vk::DependencyFlags(),
-            1, &fillBarrier,
-            0, nullptr,
-            0, nullptr
-        );
+        // ===== Phase 9: The Hot Loop =====
+        while (!glfwWindowShouldClose(window.get())) {
+            glfwPollEvents();
 
-        // Dispatch calc_depth
-        commandBuffer->bindPipeline(vk::PipelineBindPoint::eCompute, *computePipeline);
-        commandBuffer->bindDescriptorSets(
-            vk::PipelineBindPoint::eCompute,
-            *pipelineLayout,
-            0,
-            1,
-            &descriptorSet,
-            0,
-            nullptr
-        );
+            // (b) Acquire next swapchain image
+            VK_CHECK(vulkanDevice.getDevice().waitForFences(*acquireFence, VK_TRUE, UINT64_MAX));
+            vulkanDevice.getDevice().resetFences(*acquireFence);
 
-        uint32_t groupCountX = (static_cast<uint32_t>(pointData.size()) + 255) / 256;
-        commandBuffer->dispatch(groupCountX, 1, 1);
-        std::cout << "[System] Dispatched " << groupCountX << " workgroups for " << pointData.size() << " points." << std::endl;
+            auto acqResult = vulkanDevice.getDevice().acquireNextImageKHR(
+                *swapchain, UINT64_MAX, vk::Semaphore(), *acquireFence);
+            VK_CHECK(acqResult.result);
+            uint32_t imageIndex = acqResult.value;
 
-        // (f) Barrier: ShaderWrite -> ShaderRead/Write (depth calculation must complete before sorting)
-        vk::MemoryBarrier depthBarrier(
-            vk::AccessFlagBits::eShaderWrite,
-            vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite
-        );
-        commandBuffer->pipelineBarrier(
-            vk::PipelineStageFlagBits::eComputeShader,
-            vk::PipelineStageFlagBits::eComputeShader,
-            vk::DependencyFlags(),
-            1, &depthBarrier,
-            0, nullptr,
-            0, nullptr
-        );
+            VK_CHECK(vulkanDevice.getDevice().waitForFences(*acquireFence, VK_TRUE, UINT64_MAX));
 
-        // (g) Bitonic Sort - The Storm
-        commandBuffer->bindPipeline(vk::PipelineBindPoint::eCompute, *sortPipeline);
-        uint32_t sortGroupCountX = (paddedCount + 255) / 256;
-        for (uint32_t k = 2; k <= paddedCount; k <<= 1) {
-            for (uint32_t j = k / 2; j > 0; j >>= 1) {
-                uint32_t pcData[2] = {k, j};
-                commandBuffer->pushConstants<uint32_t>(*pipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, pcData);
-                commandBuffer->dispatch(sortGroupCountX, 1, 1);
+            // (c) Reset and begin recording
+            commandBuffer->reset(vk::CommandBufferResetFlags());
+            vk::CommandBufferBeginInfo beginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
+            commandBuffer->begin(beginInfo);
 
-                // Barrier after each bitonic step
-                vk::MemoryBarrier sortBarrier(
-                    vk::AccessFlagBits::eShaderWrite,
-                    vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite
-                );
-                commandBuffer->pipelineBarrier(
-                    vk::PipelineStageFlagBits::eComputeShader,
-                    vk::PipelineStageFlagBits::eComputeShader,
-                    vk::DependencyFlags(),
-                    1, &sortBarrier,
-                    0, nullptr,
-                    0, nullptr
-                );
+            // Pad buffers
+            commandBuffer->fillBuffer(sortKeyBuffer.getBuffer(), 0, VK_WHOLE_SIZE, 0xBF800000);
+            commandBuffer->fillBuffer(gaussian2DBuffer.getBuffer(), 0, VK_WHOLE_SIZE, 0);
+
+            vk::MemoryBarrier fillBarrier(
+                vk::AccessFlagBits::eTransferWrite,
+                vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite);
+            commandBuffer->pipelineBarrier(
+                vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eComputeShader,
+                vk::DependencyFlags(), 1, &fillBarrier, 0, nullptr, 0, nullptr);
+
+            // Dispatch calc_depth
+            commandBuffer->bindPipeline(vk::PipelineBindPoint::eCompute, *computePipeline);
+            commandBuffer->bindDescriptorSets(
+                vk::PipelineBindPoint::eCompute, *pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+
+            uint32_t groupCountX = (static_cast<uint32_t>(pointData.size()) + 255) / 256;
+            commandBuffer->dispatch(groupCountX, 1, 1);
+
+            vk::MemoryBarrier depthBarrier(
+                vk::AccessFlagBits::eShaderWrite,
+                vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite);
+            commandBuffer->pipelineBarrier(
+                vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eComputeShader,
+                vk::DependencyFlags(), 1, &depthBarrier, 0, nullptr, 0, nullptr);
+
+            // Dispatch bitonic sort
+            commandBuffer->bindPipeline(vk::PipelineBindPoint::eCompute, *sortPipeline);
+            uint32_t sortGroupCountX = (paddedCount + 255) / 256;
+            for (uint32_t k = 2; k <= paddedCount; k <<= 1) {
+                for (uint32_t j = k / 2; j > 0; j >>= 1) {
+                    uint32_t pcData[2] = {k, j};
+                    commandBuffer->pushConstants<uint32_t>(
+                        *pipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, pcData);
+                    commandBuffer->dispatch(sortGroupCountX, 1, 1);
+
+                    vk::MemoryBarrier sortBarrier(
+                        vk::AccessFlagBits::eShaderWrite,
+                        vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite);
+                    commandBuffer->pipelineBarrier(
+                        vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eComputeShader,
+                        vk::DependencyFlags(), 1, &sortBarrier, 0, nullptr, 0, nullptr);
+                }
             }
+
+            // Dispatch preprocess
+            vk::MemoryBarrier preprocessBarrier(
+                vk::AccessFlagBits::eShaderWrite,
+                vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite);
+            commandBuffer->pipelineBarrier(
+                vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eComputeShader,
+                vk::DependencyFlags(), 1, &preprocessBarrier, 0, nullptr, 0, nullptr);
+
+            commandBuffer->bindPipeline(vk::PipelineBindPoint::eCompute, *preprocessPipeline);
+            uint32_t preprocessGroupCountX = (paddedCount + 255) / 256;
+            commandBuffer->dispatch(preprocessGroupCountX, 1, 1);
+
+            // Dispatch rasterize
+            vk::MemoryBarrier rasterizeBarrier(
+                vk::AccessFlagBits::eShaderWrite,
+                vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite);
+            commandBuffer->pipelineBarrier(
+                vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eComputeShader,
+                vk::DependencyFlags(), 1, &rasterizeBarrier, 0, nullptr, 0, nullptr);
+
+            commandBuffer->bindPipeline(vk::PipelineBindPoint::eCompute, *rasterizePipeline);
+            uint32_t rasterizePC[3] = {static_cast<uint32_t>(pointData.size()), WIDTH, HEIGHT};
+            commandBuffer->pushConstants<uint32_t>(
+                *pipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, rasterizePC);
+            uint32_t rasterizeGroupCountX = (WIDTH + 15) / 16;
+            uint32_t rasterizeGroupCountY = (HEIGHT + 15) / 16;
+            commandBuffer->dispatch(rasterizeGroupCountX, rasterizeGroupCountY, 1);
+
+            // (e) Image copy: buffer -> swapchain image
+            // Barrier: compute shader writes to imageBuffer must be visible for transfer read
+            vk::MemoryBarrier computeToTransferBarrier(
+                vk::AccessFlagBits::eShaderWrite,
+                vk::AccessFlagBits::eTransferRead);
+            commandBuffer->pipelineBarrier(
+                vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eTransfer,
+                vk::DependencyFlags(), 1, &computeToTransferBarrier, 0, nullptr, 0, nullptr);
+
+            // Image barrier: swapchain image undefined -> transfer dst
+            vk::ImageMemoryBarrier toTransferDst(
+                vk::AccessFlagBits::eNone,
+                vk::AccessFlagBits::eTransferWrite,
+                vk::ImageLayout::eUndefined,
+                vk::ImageLayout::eTransferDstOptimal,
+                VK_QUEUE_FAMILY_IGNORED,
+                VK_QUEUE_FAMILY_IGNORED,
+                swapchainImages[imageIndex],
+                vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1));
+            commandBuffer->pipelineBarrier(
+                vk::PipelineStageFlagBits::eTopOfPipe, vk::PipelineStageFlagBits::eTransfer,
+                vk::DependencyFlags(), 0, nullptr, 0, nullptr, 1, &toTransferDst);
+
+            // Copy buffer to image
+            vk::BufferImageCopy bufferImageCopy(
+                0, 0, 0,
+                vk::ImageSubresourceLayers(vk::ImageAspectFlagBits::eColor, 0, 0, 1),
+                vk::Offset3D(0, 0, 0),
+                vk::Extent3D(WIDTH, HEIGHT, 1));
+            commandBuffer->copyBufferToImage(
+                imageBuffer.getBuffer(),
+                swapchainImages[imageIndex],
+                vk::ImageLayout::eTransferDstOptimal,
+                bufferImageCopy);
+
+            // Image barrier: transfer dst -> present src
+            vk::ImageMemoryBarrier toPresentSrc(
+                vk::AccessFlagBits::eTransferWrite,
+                vk::AccessFlagBits::eNone,
+                vk::ImageLayout::eTransferDstOptimal,
+                vk::ImageLayout::ePresentSrcKHR,
+                VK_QUEUE_FAMILY_IGNORED,
+                VK_QUEUE_FAMILY_IGNORED,
+                swapchainImages[imageIndex],
+                vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1));
+            commandBuffer->pipelineBarrier(
+                vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eBottomOfPipe,
+                vk::DependencyFlags(), 0, nullptr, 0, nullptr, 1, &toPresentSrc);
+
+            // (f) End recording
+            commandBuffer->end();
+
+            // (g) Submit and wait
+            vk::SubmitInfo submitInfo(0, nullptr, nullptr, 1, &*commandBuffer, 0, nullptr);
+            VK_CHECK(vulkanDevice.getComputeQueue().submit(1, &submitInfo, nullptr));
+            vulkanDevice.getComputeQueue().waitIdle();
+
+            // (h) Present
+            vk::PresentInfoKHR presentInfo(0, nullptr, 1, &*swapchain, &imageIndex, nullptr);
+            vulkanDevice.getComputeQueue().presentKHR(presentInfo);
         }
 
-        // (g2) Barrier: All sort writes must be visible before preprocess reads
-        vk::MemoryBarrier preprocessBarrier(
-            vk::AccessFlagBits::eShaderWrite,
-            vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite
-        );
-        commandBuffer->pipelineBarrier(
-            vk::PipelineStageFlagBits::eComputeShader,
-            vk::PipelineStageFlagBits::eComputeShader,
-            vk::DependencyFlags(),
-            1, &preprocessBarrier,
-            0, nullptr,
-            0, nullptr
-        );
-
-        // (h) Preprocess: 3D Covariance 2D Projection
-        commandBuffer->bindPipeline(vk::PipelineBindPoint::eCompute, *preprocessPipeline);
-        uint32_t preprocessGroupCountX = (paddedCount + 255) / 256;
-        commandBuffer->dispatch(preprocessGroupCountX, 1, 1);
-        std::cout << "[System] Dispatched " << preprocessGroupCountX << " workgroups for preprocess." << std::endl;
-
-        // (i) Barrier: Preprocess writes must be visible before rasterize reads
-        vk::MemoryBarrier rasterizeBarrier(
-            vk::AccessFlagBits::eShaderWrite,
-            vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite
-        );
-        commandBuffer->pipelineBarrier(
-            vk::PipelineStageFlagBits::eComputeShader,
-            vk::PipelineStageFlagBits::eComputeShader,
-            vk::DependencyFlags(),
-            1, &rasterizeBarrier,
-            0, nullptr,
-            0, nullptr
-        );
-
-        // (j) Rasterize: Pure Compute Rasterization
-        commandBuffer->bindPipeline(vk::PipelineBindPoint::eCompute, *rasterizePipeline);
-        uint32_t rasterizePC[3] = {static_cast<uint32_t>(pointData.size()), WIDTH, HEIGHT};
-        commandBuffer->pushConstants<uint32_t>(*pipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, rasterizePC);
-        uint32_t rasterizeGroupCountX = (WIDTH + 15) / 16;
-        uint32_t rasterizeGroupCountY = (HEIGHT + 15) / 16;
-        commandBuffer->dispatch(rasterizeGroupCountX, rasterizeGroupCountY, 1);
-        std::cout << "[System] Dispatched " << rasterizeGroupCountX << "x" << rasterizeGroupCountY 
-                  << " workgroups for rasterization (" << WIDTH << "x" << HEIGHT << ")." << std::endl;
-
-        commandBuffer->end();
-
-        vk::SubmitInfo submitInfo(
-            0, nullptr, nullptr,
-            1, &*commandBuffer
-        );
-
-        VK_CHECK(vulkanDevice.getComputeQueue().submit(1, &submitInfo, nullptr));
-        vulkanDevice.getComputeQueue().waitIdle();
-
-        std::cout << "[System] Compute dispatch complete." << std::endl;
-
-        // 15. Reverse DMA: Readback SortKeyBuffer for verification (回程高铁)
-        VmaBuffer readbackBuffer(
-            vulkanDevice.getAllocator(),
-            sortKeyBufferSize,
-            vk::BufferUsageFlagBits::eTransferDst,
-            VMA_MEMORY_USAGE_GPU_TO_CPU
-        );
-
-        vk::CommandBufferAllocateInfo readbackCmdBufInfo(
-            *commandPool,
-            vk::CommandBufferLevel::ePrimary,
-            1
-        );
-        auto readbackCmdBuffers = vulkanDevice.getDevice().allocateCommandBuffersUnique(readbackCmdBufInfo);
-        auto& readbackCmdBuffer = readbackCmdBuffers[0];
-
-        vk::CommandBufferBeginInfo readbackBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
-        readbackCmdBuffer->begin(readbackBeginInfo);
-
-        vk::BufferCopy readbackCopyRegion(0, 0, sortKeyBufferSize);
-        readbackCmdBuffer->copyBuffer(
-            sortKeyBuffer.getBuffer(),
-            readbackBuffer.getBuffer(),
-            readbackCopyRegion
-        );
-
-        readbackCmdBuffer->end();
-
-        vk::SubmitInfo readbackSubmitInfo(
-            0, nullptr, nullptr,
-            1, &*readbackCmdBuffer,
-            0, nullptr
-        );
-
-        VK_CHECK(vulkanDevice.getComputeQueue().submit(1, &readbackSubmitInfo, nullptr));
-        vulkanDevice.getComputeQueue().waitIdle();
-
-        // 16. Verify results
-        SortKeyPair* readbackData = static_cast<SortKeyPair*>(readbackBuffer.map());
-
-        std::cout << "\n[System] === Depth Verification ===" << std::endl;
-        std::cout << std::fixed << std::setprecision(4);
-        
-        if (pointData.size() > 0) {
-            std::cout << "[System] SortKeyPair[0]: depth = " << readbackData[0].depth 
-                      << ", index = " << readbackData[0].index << std::endl;
-        }
-        
-        if (pointData.size() > 100) {
-            std::cout << "[System] SortKeyPair[100]: depth = " << readbackData[100].depth 
-                      << ", index = " << readbackData[100].index << std::endl;
-        }
-
-        // (h) Bitonic sort verification: print first 5 elements and last valid element
-        std::cout << "\n[System] === Bitonic Sort Verification (Descending) ===" << std::endl;
-        std::cout << "[System] Padded count: " << paddedCount << ", Valid points: " << pointData.size() << std::endl;
-
-        uint32_t printCount = std::min(static_cast<uint32_t>(5), static_cast<uint32_t>(pointData.size()));
-        for (uint32_t i = 0; i < printCount; ++i) {
-            std::cout << "[System] SortKeyPair[" << i << "]: depth = " << readbackData[i].depth 
-                      << ", index = " << readbackData[i].index << std::endl;
-        }
-
-        if (pointData.size() > 1) {
-            uint32_t lastIdx = static_cast<uint32_t>(pointData.size()) - 1;
-            std::cout << "[System] SortKeyPair[" << lastIdx << "]: depth = " << readbackData[lastIdx].depth 
-                      << ", index = " << readbackData[lastIdx].index << std::endl;
-        }
-
-        std::cout << "[System] === Verification Complete ===" << std::endl;
-
-        readbackBuffer.unmap();
-
-        std::cout << "[System] VERIFICATION SUCCESS: Depth Key-Value generation complete." << std::endl;
-
-        // 17. Reverse DMA: Readback Gaussian2DBuffer for projection verification
-        VmaBuffer gaussian2DReadbackBuffer(
-            vulkanDevice.getAllocator(),
-            gaussian2DBufferSize,
-            vk::BufferUsageFlagBits::eTransferDst,
-            VMA_MEMORY_USAGE_GPU_TO_CPU
-        );
-
-        vk::CommandBufferAllocateInfo g2dReadbackCmdBufInfo(
-            *commandPool,
-            vk::CommandBufferLevel::ePrimary,
-            1
-        );
-        auto g2dReadbackCmdBuffers = vulkanDevice.getDevice().allocateCommandBuffersUnique(g2dReadbackCmdBufInfo);
-        auto& g2dReadbackCmdBuffer = g2dReadbackCmdBuffers[0];
-
-        vk::CommandBufferBeginInfo g2dReadbackBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
-        g2dReadbackCmdBuffer->begin(g2dReadbackBeginInfo);
-
-        vk::BufferCopy g2dReadbackCopyRegion(0, 0, gaussian2DBufferSize);
-        g2dReadbackCmdBuffer->copyBuffer(
-            gaussian2DBuffer.getBuffer(),
-            gaussian2DReadbackBuffer.getBuffer(),
-            g2dReadbackCopyRegion
-        );
-
-        g2dReadbackCmdBuffer->end();
-
-        vk::SubmitInfo g2dReadbackSubmitInfo(
-            0, nullptr, nullptr,
-            1, &*g2dReadbackCmdBuffer,
-            0, nullptr
-        );
-
-        VK_CHECK(vulkanDevice.getComputeQueue().submit(1, &g2dReadbackSubmitInfo, nullptr));
-        vulkanDevice.getComputeQueue().waitIdle();
-
-        // 18. Verify 2D projection results
-        Gaussian2D* g2dReadbackData = static_cast<Gaussian2D*>(gaussian2DReadbackBuffer.map());
-
-        std::cout << "\n[System] === 2D Projection Verification ===" << std::endl;
-        std::cout << "[System] Padded count: " << paddedCount << ", Valid points: " << pointData.size() << std::endl;
-
-        uint32_t g2dPrintCount = std::min(static_cast<uint32_t>(5), static_cast<uint32_t>(pointData.size()));
-        for (uint32_t i = 0; i < g2dPrintCount; ++i) {
-            std::cout << "[System] Gaussian2D[" << i << "]: pos2D = (" 
-                      << g2dReadbackData[i].pos2D[0] << ", " << g2dReadbackData[i].pos2D[1] << ")"
-                      << ", depth = " << g2dReadbackData[i].depth
-                      << ", opacity = " << g2dReadbackData[i].opacity
-                      << ", conic = (" << g2dReadbackData[i].conic[0] << ", " 
-                      << g2dReadbackData[i].conic[1] << ", " << g2dReadbackData[i].conic[2] << ")"
-                      << ", color = (" << g2dReadbackData[i].color[0] << ", "
-                      << g2dReadbackData[i].color[1] << ", " << g2dReadbackData[i].color[2] << ")"
-                      << std::endl;
-        }
-
-        std::cout << "[System] === 2D Projection Verification Complete ===" << std::endl;
-
-        gaussian2DReadbackBuffer.unmap();
-
-        std::cout << "[System] VERIFICATION SUCCESS: 3D to 2D covariance projection complete." << std::endl;
-
-        // 19. Reverse DMA: Readback ImageBuffer for PPM output
-        VmaBuffer readbackImageBuffer(
-            vulkanDevice.getAllocator(),
-            imageBufferSize,
-            vk::BufferUsageFlagBits::eTransferDst,
-            VMA_MEMORY_USAGE_GPU_TO_CPU
-        );
-
-        vk::CommandBufferAllocateInfo imgReadbackCmdBufInfo(
-            *commandPool,
-            vk::CommandBufferLevel::ePrimary,
-            1
-        );
-        auto imgReadbackCmdBuffers = vulkanDevice.getDevice().allocateCommandBuffersUnique(imgReadbackCmdBufInfo);
-        auto& imgReadbackCmdBuffer = imgReadbackCmdBuffers[0];
-
-        vk::CommandBufferBeginInfo imgReadbackBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
-        imgReadbackCmdBuffer->begin(imgReadbackBeginInfo);
-
-        vk::BufferCopy imgReadbackCopyRegion(0, 0, imageBufferSize);
-        imgReadbackCmdBuffer->copyBuffer(
-            imageBuffer.getBuffer(),
-            readbackImageBuffer.getBuffer(),
-            imgReadbackCopyRegion
-        );
-
-        imgReadbackCmdBuffer->end();
-
-        vk::SubmitInfo imgReadbackSubmitInfo(
-            0, nullptr, nullptr,
-            1, &*imgReadbackCmdBuffer,
-            0, nullptr
-        );
-
-        VK_CHECK(vulkanDevice.getComputeQueue().submit(1, &imgReadbackSubmitInfo, nullptr));
-        vulkanDevice.getComputeQueue().waitIdle();
-
-        // 20. Write PPM file
-        float* imageData = static_cast<float*>(readbackImageBuffer.map());
-
-        std::ofstream ppmFile("output.ppm");
-        ppmFile << "P3\n" << WIDTH << " " << HEIGHT << "\n255\n";
-
-        for (uint32_t y = 0; y < HEIGHT; ++y) {
-            for (uint32_t x = 0; x < WIDTH; ++x) {
-                uint32_t idx = (y * WIDTH + x) * 4;
-                int r = static_cast<int>(std::clamp(imageData[idx + 0] * 255.0f, 0.0f, 255.0f));
-                int g = static_cast<int>(std::clamp(imageData[idx + 1] * 255.0f, 0.0f, 255.0f));
-                int b = static_cast<int>(std::clamp(imageData[idx + 2] * 255.0f, 0.0f, 255.0f));
-                ppmFile << r << " " << g << " " << b << "\n";
-            }
-        }
-
-        ppmFile.close();
-        readbackImageBuffer.unmap();
-
-        std::cout << "[System] RENDER SUCCESS: Image saved to output.ppm." << std::endl;
+        std::cout << "[System] Render loop exited. Shutting down..." << std::endl;
+        vulkanDevice.getDevice().waitIdle();
 
     } catch (const std::exception& e) {
         std::cerr << "Critical Error: " << e.what() << std::endl;

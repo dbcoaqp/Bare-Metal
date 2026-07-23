@@ -8,6 +8,7 @@ find_package(Vulkan REQUIRED)
 
 add_subdirectory(third_party/VMA)
 
+find_package(glfw3 REQUIRED)
 
 # Offline SPIR-V compilation (CONVENTIONS.md §2: Runtime compilation is BANNED)
 find_program(GLSLC glslc REQUIRED)
@@ -66,4 +67,4 @@ target_compile_definitions(BareMetalComputeProbe PRIVATE
     VULKAN_HPP_DISPATCH_LOADER_DYNAMIC=1
     SHADER_DIR="${CMAKE_SOURCE_DIR}/shaders"
 )
-target_link_libraries(BareMetalComputeProbe PRIVATE Vulkan::Vulkan VulkanMemoryAllocator)
+target_link_libraries(BareMetalComputeProbe PRIVATE Vulkan::Vulkan VulkanMemoryAllocator glfw)

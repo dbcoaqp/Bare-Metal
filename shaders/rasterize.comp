@@ -16,7 +16,7 @@ layout(std430, binding = 3) readonly buffer Gaussian2DBuffer {
 };
 
 layout(std430, binding = 4) buffer ImageBuffer {
-    vec4 pixels[];
+    uint pixels[];
 };
 
 layout(push_constant) uniform PushConstants {
@@ -48,6 +48,10 @@ void main() {
         finalColor = mix(finalColor, g.color, alpha);
     }
 
+    uint r = uint(clamp(finalColor.r, 0.0, 1.0) * 255.0);
+    uint g = uint(clamp(finalColor.g, 0.0, 1.0) * 255.0);
+    uint b = uint(clamp(finalColor.b, 0.0, 1.0) * 255.0);
+    uint a = 255u;
     uint idx = pixel.y * pc.width + pixel.x;
-    pixels[idx] = vec4(finalColor, 1.0);
+    pixels[idx] = b | (g << 8u) | (r << 16u) | (a << 24u);
 }
