@@ -8,6 +8,12 @@ find_package(Vulkan REQUIRED)
 
 add_subdirectory(third_party/VMA)
 
+
+set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+add_subdirectory(third_party/glfw)
+
 find_package(glfw3 REQUIRED)
 
 # Offline SPIR-V compilation (CONVENTIONS.md §2: Runtime compilation is BANNED)
