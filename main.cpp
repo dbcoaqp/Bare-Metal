@@ -548,7 +548,7 @@ int main() {
         VmaBuffer gaussian2DBuffer(
             vulkanDevice.getAllocator(),
             gaussian2DBufferSize,
-            vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc,
+            vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst,
             VMA_MEMORY_USAGE_GPU_ONLY
         );
         std::cout << "[System] Gaussian2D buffer created (" << gaussian2DBufferSize << " bytes)." << std::endl;
@@ -882,7 +882,7 @@ int main() {
 
             // (h) Present
             vk::PresentInfoKHR presentInfo(0, nullptr, 1, &*swapchain, &imageIndex, nullptr);
-            vulkanDevice.getComputeQueue().presentKHR(presentInfo);
+            (void)vulkanDevice.getComputeQueue().presentKHR(presentInfo);
         }
 
         std::cout << "[System] Render loop exited. Shutting down..." << std::endl;
