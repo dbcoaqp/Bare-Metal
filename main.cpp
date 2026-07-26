@@ -14,6 +14,7 @@
 #include <iomanip>
 #include <algorithm>
 #include <fstream>
+#include <cmath>
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -29,6 +30,45 @@
 
 // Global function pointer table memory allocation
 VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE;
+
+// ============================================================
+// Phase 10: Mouse state globals for camera control
+// ============================================================
+static double lastMouseX = 0.0;
+static double lastMouseY = 0.0;
+static float yaw = -90.0f;   // Initial yaw: looking along +Z (toward origin)
+static float pitch = 0.0f;
+static bool isLeftMouseDown = false;
+
+static void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
+    (void)mods;
+    if (button == GLFW_MOUSE_BUTTON_LEFT) {
+        if (action == GLFW_PRESS) {
+            isLeftMouseDown = true;
+            glfwGetCursorPos(window, &lastMouseX, &lastMouseY);
+        } else if (action == GLFW_RELEASE) {
+            isLeftMouseDown = false;
+        }
+    }
+}
+
+static void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
+    (void)window;
+    if (!isLeftMouseDown) return;
+
+    float xOffset = static_cast<float>(xpos - lastMouseX);
+    float yOffset = static_cast<float>(lastMouseY - ypos); // y-axis inverted
+
+    lastMouseX = xpos;
+    lastMouseY = ypos;
+
+    float sensitivity = 0.1f;
+    yaw += xOffset * sensitivity;
+    pitch += yOffset * sensitivity;
+
+    if (pitch > 89.0f) pitch = 89.0f;
+    if (pitch < -89.0f) pitch = -89.0f;
+}
 
 class GlfwGuard {
 public:
@@ -349,6 +389,11 @@ int main() {
 
         // ===== Phase 9: Create GLFW Window & Surface =====
         GlfwWindow window(WIDTH, HEIGHT, "Bare Metal 3DGS");
+
+        glfwSetMouseButtonCallback(window.get(), mouseButtonCallback);
+        glfwSetCursorPosCallback(window.get(), cursorPosCallback);
+        glfwGetCursorPos(window.get(), &lastMouseX, &lastMouseY);
+
         WindowSurface surface(vkInstance.get(), window.get());
 
         TargetDevice target = DeviceSelector::selectOptimalDevice(vkInstance.get(), surface.get());
@@ -501,16 +546,29 @@ int main() {
         std::cout << "[System] DMA Transfer Complete: Gaussian data injected into Device Local VRAM." << std::endl;
 
         // 6. Camera buffer
+        constexpr float PI = 3.14159265358979f;
+
         CameraUniform cameraData{};
-        MathUtils::buildViewProjection(cameraData.viewProj, 0.0f, 0.0f, -5.0f, WIDTH, HEIGHT);
+
+        // Compute initial forward from yaw/pitch
+        float radYaw = yaw * PI / 180.0f;
+        float radPitch = pitch * PI / 180.0f;
+        float initFwdX = std::cos(radPitch) * std::cos(radYaw);
+        float initFwdY = std::sin(radPitch);
+        float initFwdZ = std::cos(radPitch) * std::sin(radYaw);
+
         cameraData.cameraPosition[0] = 0.0f;
         cameraData.cameraPosition[1] = 0.0f;
-        cameraData.cameraPosition[2] = -5.0f;
+        cameraData.cameraPosition[2] = 5.0f;
         cameraData.cameraPosition[3] = 0.0f;
-        cameraData.cameraForward[0] = 0.0f;
-        cameraData.cameraForward[1] = 0.0f;
-        cameraData.cameraForward[2] = 1.0f;
+        cameraData.cameraForward[0] = initFwdX;
+        cameraData.cameraForward[1] = initFwdY;
+        cameraData.cameraForward[2] = initFwdZ;
         cameraData.cameraForward[3] = 0.0f;
+
+        MathUtils::buildViewProjection(cameraData.viewProj, 0.0f, 0.0f, 5.0f,
+            initFwdX, initFwdY, initFwdZ, WIDTH, HEIGHT);
+
         cameraData.focal_x = 1000.0f;
         cameraData.focal_y = 1000.0f;
         cameraData.tan_fovx = 0.5f;
@@ -527,11 +585,11 @@ int main() {
             VMA_MEMORY_USAGE_CPU_TO_GPU
         );
 
-        void* cameraMapped = cameraBuffer.map();
-        std::memcpy(cameraMapped, &cameraData, sizeof(CameraUniform));
+        CameraUniform* mappedCameraData = static_cast<CameraUniform*>(cameraBuffer.map());
+        std::memcpy(mappedCameraData, &cameraData, sizeof(CameraUniform));
         cameraBuffer.flush();
-        cameraBuffer.unmap();
-        std::cout << "[System] Camera buffer created." << std::endl;
+        std::cout << "[System] Camera buffer created (persistent mapped), position (0, 0, 5), forward ("
+                  << initFwdX << ", " << initFwdY << ", " << initFwdZ << "), yaw=" << yaw << std::endl;
 
         // 7. Sort key buffer
         vk::DeviceSize sortKeyBufferSize = static_cast<vk::DeviceSize>(paddedCount) * sizeof(SortKeyPair);
@@ -728,24 +786,52 @@ int main() {
         vk::FenceCreateInfo acquireFenceInfo(vk::FenceCreateFlagBits::eSignaled);
         auto acquireFence = vulkanDevice.getDevice().createFenceUnique(acquireFenceInfo);
 
+        // Phase 10: Vulkan traffic lights (semaphores)
+        vk::SemaphoreCreateInfo semaphoreCreateInfo;
+        auto imageAvailableSemaphore = vulkanDevice.getDevice().createSemaphoreUnique(semaphoreCreateInfo);
+        auto renderFinishedSemaphore = vulkanDevice.getDevice().createSemaphoreUnique(semaphoreCreateInfo);
+        std::cout << "[System] Synchronization semaphores created." << std::endl;
+
         std::cout << "[System] Entering render loop..." << std::endl;
 
-        // ===== Phase 9: The Hot Loop =====
+        // ===== Phase 10: The Async Hot Loop =====
         while (!glfwWindowShouldClose(window.get())) {
             glfwPollEvents();
 
-            // (b) Acquire next swapchain image
+            // (a)(b) Dynamic camera update from mouse input
+            float radYaw = yaw * PI / 180.0f;
+            float radPitch = pitch * PI / 180.0f;
+            float fwdX = std::cos(radPitch) * std::cos(radYaw);
+            float fwdY = std::sin(radPitch);
+            float fwdZ = std::cos(radPitch) * std::sin(radYaw);
+
+            mappedCameraData->cameraForward[0] = fwdX;
+            mappedCameraData->cameraForward[1] = fwdY;
+            mappedCameraData->cameraForward[2] = fwdZ;
+            mappedCameraData->cameraForward[3] = 0.0f;
+            mappedCameraData->cameraPosition[0] = 0.0f;
+            mappedCameraData->cameraPosition[1] = 0.0f;
+            mappedCameraData->cameraPosition[2] = 5.0f;
+            mappedCameraData->cameraPosition[3] = 0.0f;
+
+            MathUtils::buildViewProjection(mappedCameraData->viewProj, 0.0f, 0.0f, 5.0f,
+                fwdX, fwdY, fwdZ, WIDTH, HEIGHT);
+            cameraBuffer.flush();
+
+            // (c) Acquire next swapchain image with semaphore and fence
             VK_CHECK(vulkanDevice.getDevice().waitForFences(*acquireFence, VK_TRUE, UINT64_MAX));
             vulkanDevice.getDevice().resetFences(*acquireFence);
 
             auto acqResult = vulkanDevice.getDevice().acquireNextImageKHR(
-                *swapchain, UINT64_MAX, vk::Semaphore(), *acquireFence);
+                *swapchain, UINT64_MAX, *imageAvailableSemaphore, *acquireFence);
             VK_CHECK(acqResult.result);
             uint32_t imageIndex = acqResult.value;
 
+            // (d) Wait for acquire, then reset fence for submit use
             VK_CHECK(vulkanDevice.getDevice().waitForFences(*acquireFence, VK_TRUE, UINT64_MAX));
+            vulkanDevice.getDevice().resetFences(*acquireFence);
 
-            // (c) Reset and begin recording
+            // (e) Record command buffer
             commandBuffer->reset(vk::CommandBufferResetFlags());
             vk::CommandBufferBeginInfo beginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
             commandBuffer->begin(beginInfo);
@@ -823,8 +909,7 @@ int main() {
             uint32_t rasterizeGroupCountY = (HEIGHT + 15) / 16;
             commandBuffer->dispatch(rasterizeGroupCountX, rasterizeGroupCountY, 1);
 
-            // (e) Image copy: buffer -> swapchain image
-            // Barrier: compute shader writes to imageBuffer must be visible for transfer read
+            // Image copy: buffer -> swapchain image
             vk::MemoryBarrier computeToTransferBarrier(
                 vk::AccessFlagBits::eShaderWrite,
                 vk::AccessFlagBits::eTransferRead);
@@ -832,7 +917,6 @@ int main() {
                 vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eTransfer,
                 vk::DependencyFlags(), 1, &computeToTransferBarrier, 0, nullptr, 0, nullptr);
 
-            // Image barrier: swapchain image undefined -> transfer dst
             vk::ImageMemoryBarrier toTransferDst(
                 vk::AccessFlagBits::eNone,
                 vk::AccessFlagBits::eTransferWrite,
@@ -846,7 +930,6 @@ int main() {
                 vk::PipelineStageFlagBits::eTopOfPipe, vk::PipelineStageFlagBits::eTransfer,
                 vk::DependencyFlags(), 0, nullptr, 0, nullptr, 1, &toTransferDst);
 
-            // Copy buffer to image
             vk::BufferImageCopy bufferImageCopy(
                 0, 0, 0,
                 vk::ImageSubresourceLayers(vk::ImageAspectFlagBits::eColor, 0, 0, 1),
@@ -858,7 +941,6 @@ int main() {
                 vk::ImageLayout::eTransferDstOptimal,
                 bufferImageCopy);
 
-            // Image barrier: transfer dst -> present src
             vk::ImageMemoryBarrier toPresentSrc(
                 vk::AccessFlagBits::eTransferWrite,
                 vk::AccessFlagBits::eNone,
@@ -872,16 +954,27 @@ int main() {
                 vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eBottomOfPipe,
                 vk::DependencyFlags(), 0, nullptr, 0, nullptr, 1, &toPresentSrc);
 
-            // (f) End recording
             commandBuffer->end();
 
-            // (g) Submit and wait
-            vk::SubmitInfo submitInfo(0, nullptr, nullptr, 1, &*commandBuffer, 0, nullptr);
-            VK_CHECK(vulkanDevice.getComputeQueue().submit(1, &submitInfo, nullptr));
-            vulkanDevice.getComputeQueue().waitIdle();
+            // (f)(g) Submit with semaphore synchronization — NO waitIdle!
+            vk::Semaphore waitSemaphores[] = {*imageAvailableSemaphore};
+            vk::PipelineStageFlags waitStages[] = {vk::PipelineStageFlagBits::eTransfer};
+            vk::Semaphore signalSemaphores[] = {*renderFinishedSemaphore};
 
-            // (h) Present
-            vk::PresentInfoKHR presentInfo(0, nullptr, 1, &*swapchain, &imageIndex, nullptr);
+            vk::SubmitInfo submitInfo(
+                1, waitSemaphores, waitStages,
+                1, &*commandBuffer,
+                1, signalSemaphores
+            );
+            VK_CHECK(vulkanDevice.getComputeQueue().submit(1, &submitInfo, *acquireFence));
+
+            // (h) Present with semaphore wait (display must wait for GPU to finish)
+            vk::PresentInfoKHR presentInfo(
+                1, signalSemaphores,
+                1, &*swapchain,
+                &imageIndex,
+                nullptr
+            );
             (void)vulkanDevice.getComputeQueue().presentKHR(presentInfo);
         }
 
