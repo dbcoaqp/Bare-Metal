@@ -792,10 +792,17 @@ int main() {
         auto renderFinishedSemaphore = vulkanDevice.getDevice().createSemaphoreUnique(semaphoreCreateInfo);
         std::cout << "[System] Synchronization semaphores created." << std::endl;
 
+        vk::FenceCreateInfo renderFenceInfo(vk::FenceCreateFlagBits::eSignaled);
+        auto renderFence = vulkanDevice.getDevice().createFenceUnique(renderFenceInfo);
+
         std::cout << "[System] Entering render loop..." << std::endl;
 
         // ===== Phase 10: The Async Hot Loop =====
         while (!glfwWindowShouldClose(window.get())) {
+            VK_CHECK(vulkanDevice.getDevice().waitForFences(*renderFence, VK_TRUE, UINT64_MAX));
+            vulkanDevice.getDevice().resetFences(*renderFence);
+
+            auto acqResult = vulkanDevice.getDevice().acquireNextImageKHR(*swapchain, UINT64_MAX, *imageAvailableSemaphore, nullptr);
             glfwPollEvents();
 
             // (a)(b) Dynamic camera update from mouse input
@@ -967,6 +974,7 @@ int main() {
                 1, signalSemaphores
             );
             VK_CHECK(vulkanDevice.getComputeQueue().submit(1, &submitInfo, *acquireFence));
+            VK_CHECK(vulkanDevice.getComputeQueue().submit(1, &submitInfo, *renderFence));
 
             // (h) Present with semaphore wait (display must wait for GPU to finish)
             vk::PresentInfoKHR presentInfo(
@@ -980,6 +988,7 @@ int main() {
 
         std::cout << "[System] Render loop exited. Shutting down..." << std::endl;
         vulkanDevice.getDevice().waitIdle();
+        cameraBuffer.unmap();
 
     } catch (const std::exception& e) {
         std::cerr << "Critical Error: " << e.what() << std::endl;
