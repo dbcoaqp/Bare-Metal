@@ -21,8 +21,14 @@ find_program(GLSLC glslc REQUIRED)
 set(SHADER_SRC "${CMAKE_SOURCE_DIR}/shaders/calc_depth.comp")
 set(SHADER_BIN "${CMAKE_SOURCE_DIR}/shaders/calc_depth.spv")
 
-set(BITONIC_SHADER_SRC "${CMAKE_SOURCE_DIR}/shaders/bitonic_sort.comp")
-set(BITONIC_SHADER_BIN "${CMAKE_SOURCE_DIR}/shaders/bitonic_sort.spv")
+set(RADIX_HISTOGRAM_SHADER_SRC "${CMAKE_SOURCE_DIR}/shaders/radix_histogram.comp")
+set(RADIX_HISTOGRAM_SHADER_BIN "${CMAKE_SOURCE_DIR}/shaders/radix_histogram.spv")
+
+set(RADIX_SCAN_SHADER_SRC "${CMAKE_SOURCE_DIR}/shaders/radix_scan.comp")
+set(RADIX_SCAN_SHADER_BIN "${CMAKE_SOURCE_DIR}/shaders/radix_scan.spv")
+
+set(RADIX_SCATTER_SHADER_SRC "${CMAKE_SOURCE_DIR}/shaders/radix_scatter.comp")
+set(RADIX_SCATTER_SHADER_BIN "${CMAKE_SOURCE_DIR}/shaders/radix_scatter.spv")
 
 set(PREPROCESS_SHADER_SRC "${CMAKE_SOURCE_DIR}/shaders/preprocess.comp")
 set(PREPROCESS_SHADER_BIN "${CMAKE_SOURCE_DIR}/shaders/preprocess.spv")
@@ -38,10 +44,24 @@ add_custom_command(
 )
 
 add_custom_command(
-    OUTPUT ${BITONIC_SHADER_BIN}
-    COMMAND ${GLSLC} ${BITONIC_SHADER_SRC} -o ${BITONIC_SHADER_BIN}
-    DEPENDS ${BITONIC_SHADER_SRC}
-    COMMENT "Compiling compute shader: bitonic_sort.comp -> bitonic_sort.spv"
+    OUTPUT ${RADIX_HISTOGRAM_SHADER_BIN}
+    COMMAND ${GLSLC} ${RADIX_HISTOGRAM_SHADER_SRC} -o ${RADIX_HISTOGRAM_SHADER_BIN}
+    DEPENDS ${RADIX_HISTOGRAM_SHADER_SRC}
+    COMMENT "Compiling compute shader: radix_histogram.comp -> radix_histogram.spv"
+)
+
+add_custom_command(
+    OUTPUT ${RADIX_SCAN_SHADER_BIN}
+    COMMAND ${GLSLC} ${RADIX_SCAN_SHADER_SRC} -o ${RADIX_SCAN_SHADER_BIN}
+    DEPENDS ${RADIX_SCAN_SHADER_SRC}
+    COMMENT "Compiling compute shader: radix_scan.comp -> radix_scan.spv"
+)
+
+add_custom_command(
+    OUTPUT ${RADIX_SCATTER_SHADER_BIN}
+    COMMAND ${GLSLC} ${RADIX_SCATTER_SHADER_SRC} -o ${RADIX_SCATTER_SHADER_BIN}
+    DEPENDS ${RADIX_SCATTER_SHADER_SRC}
+    COMMENT "Compiling compute shader: radix_scatter.comp -> radix_scatter.spv"
 )
 
 add_custom_command(
@@ -58,7 +78,13 @@ add_custom_command(
     COMMENT "Compiling compute shader: rasterize.comp -> rasterize.spv"
 )
 
-add_custom_target(CompileShaders ALL DEPENDS ${SHADER_BIN} ${BITONIC_SHADER_BIN} ${PREPROCESS_SHADER_BIN} ${RASTERIZE_SHADER_BIN})
+add_custom_target(CompileShaders ALL DEPENDS 
+    ${SHADER_BIN} 
+    ${RADIX_HISTOGRAM_SHADER_BIN} 
+    ${RADIX_SCAN_SHADER_BIN} 
+    ${RADIX_SCATTER_SHADER_BIN} 
+    ${PREPROCESS_SHADER_BIN} 
+    ${RASTERIZE_SHADER_BIN})
 
 include_directories(${Vulkan_INCLUDE_DIRS})
 include_directories(${CMAKE_SOURCE_DIR})

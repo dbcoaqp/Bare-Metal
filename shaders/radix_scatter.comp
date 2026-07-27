@@ -1,0 +1,69 @@
+#version 460
+layout(local_size_x = 256) in;
+
+struct SortKeyPair {
+    uint key;
+    uint index;
+};
+
+layout(std430, binding = 1) readonly buffer SrcBuffer {
+    SortKeyPair src[];
+};
+
+layout(std430, binding = 5) buffer DstBuffer {
+    SortKeyPair dst[];
+};
+
+layout(std430, binding = 6) readonly buffer HistogramBuffer {
+    uint histogram[];
+};
+
+layout(std430, binding = 7) buffer OffsetBuffer {
+    uint offsets[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint shift;
+    uint _pad1;
+    uint _pad2;
+} pc;
+
+shared uint localHist[256];    // Local histogram for this workgroup (read from global)
+shared uint localPrefix[256];  // Exclusive prefix sum of local histogram
+shared uint wgBaseOffset[256]; // Workgroup base offset per bucket (from atomicAdd)
+shared uint localCounter[256]; // Per-bucket atomic counter for local ranking
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint gid = gl_GlobalInvocationID.x;
+    uint wgId = gl_WorkGroupID.x;
+
+    // Phase 1: Load this workgroup's local histogram from the global buffer
+    localHist[tid] = histogram[wgId * 256 + tid];
+    barrier();
+
+    // Phase 2: Compute exclusive prefix sum of local histogram (Hillis-Steele)
+    //localPrefix[tid] = localHist[tid];
+    //barrier();
+
+
+    // Convert inclusive to exclusive prefix sum
+    //localPrefix[tid] = localPrefix[tid] - localHist[tid];
+    //barrier();
+
+    // Phase 3: Atomically claim space from global offsets
+    // Each thread claims localHist[tid] slots from the global offset for bucket tid
+    wgBaseOffset[tid] = atomicAdd(offsets[tid], localHist[tid]);
+    barrier();
+
+    // Phase 4: Each thread determines its local rank and scatters to destination
+    localCounter[tid] = 0u;
+    barrier();
+
+    if (gid < src.length()) {
+        uint bucket = (src[gid].key >> pc.shift) & 0xFFu;
+        uint localRank = atomicAdd(localCounter[bucket], 1u);
+        uint finalPos = wgBaseOffset[bucket] + localRank;
+        dst[finalPos] = src[gid];
+    }
+}

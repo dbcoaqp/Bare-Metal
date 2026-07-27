@@ -10,7 +10,7 @@ struct GaussianPoint {
 };
 
 struct SortKeyPair {
-    float depth;
+    uint key;
     uint index;
 };
 
@@ -68,12 +68,14 @@ void main() {
     if (idx >= sortKeys.length()) return;
 
     uint srcIdx = sortKeys[idx].index;
-    float depth = sortKeys[idx].depth;
 
-    // Skip padding/dead points (sentinel value from bitonic sort)
-    if (depth == -1.0) return;
+    // Skip padding elements (filled with 0xFFFFFFFF during radix sort init)
+    if (srcIdx >= gaussians.length()) return;
 
     GaussianPoint gp = gaussians[srcIdx];
+
+    // Recompute depth from position (stored as sortable uint key, not raw float)
+    float depth = dot(gp.position - cameraPosition.xyz, cameraForward.xyz);
 
     // 1. Transform to clip space
     vec4 p_world = vec4(gp.position, 1.0);

@@ -491,8 +491,10 @@ int main() {
         while (paddedCount < pointData.size()) {
             paddedCount <<= 1;
         }
-        std::cout << "[System] Bitonic sort padded count: " << paddedCount 
+        std::cout << "[System] Radix sort padded count: " << paddedCount 
                   << " (original: " << pointData.size() << ")." << std::endl;
+
+        uint32_t histogramGroupCount = (paddedCount + 255) / 256;
 
         // 3. Staging buffer and DMA transfer
         VmaBuffer stagingBuffer(
@@ -621,6 +623,36 @@ int main() {
         );
         std::cout << "[System] Image buffer created (" << imageBufferSize << " bytes, " << WIDTH << "x" << HEIGHT << " BGRA8)." << std::endl;
 
+        // 7d. Sort key buffer alt (ping-pong for radix sort)
+        VmaBuffer sortKeyBufferAlt(
+            vulkanDevice.getAllocator(),
+            sortKeyBufferSize,
+            vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eTransferSrc,
+            VMA_MEMORY_USAGE_GPU_ONLY
+        );
+        std::cout << "[System] Sort key buffer alt created (" << sortKeyBufferSize << " bytes, ping-pong)." << std::endl;
+
+        // 7e. Histogram buffer for radix sort: [histogramGroupCount * 256] uint32_t
+        vk::DeviceSize histogramBufferSize = static_cast<vk::DeviceSize>(histogramGroupCount) * 256 * sizeof(uint32_t);
+        VmaBuffer histogramBuffer(
+            vulkanDevice.getAllocator(),
+            histogramBufferSize,
+            vk::BufferUsageFlagBits::eStorageBuffer,
+            VMA_MEMORY_USAGE_GPU_ONLY
+        );
+        std::cout << "[System] Radix histogram buffer created (" << histogramBufferSize 
+                  << " bytes, " << histogramGroupCount << " workgroups x 256 buckets)." << std::endl;
+
+        // 7f. Global offset buffer for radix sort: [256] uint32_t
+        vk::DeviceSize globalOffsetBufferSize = 256 * sizeof(uint32_t);
+        VmaBuffer globalOffsetBuffer(
+            vulkanDevice.getAllocator(),
+            globalOffsetBufferSize,
+            vk::BufferUsageFlagBits::eStorageBuffer,
+            VMA_MEMORY_USAGE_GPU_ONLY
+        );
+        std::cout << "[System] Radix global offset buffer created (" << globalOffsetBufferSize << " bytes)." << std::endl;
+
         // 8. Shader module
         vk::ShaderModuleCreateInfo shaderModuleCreateInfo(
             vk::ShaderModuleCreateFlags(),
@@ -629,13 +661,16 @@ int main() {
         );
         auto shaderModule = vulkanDevice.getDevice().createShaderModuleUnique(shaderModuleCreateInfo);
 
-        // 9. Descriptor set layout
+        // 9. Descriptor set layout (8 bindings: original 5 + radix sort 3)
         std::vector<vk::DescriptorSetLayoutBinding> layoutBindings = {
-            vk::DescriptorSetLayoutBinding(0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute),
-            vk::DescriptorSetLayoutBinding(1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute),
-            vk::DescriptorSetLayoutBinding(2, vk::DescriptorType::eUniformBuffer, 1, vk::ShaderStageFlagBits::eCompute),
-            vk::DescriptorSetLayoutBinding(3, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute),
-            vk::DescriptorSetLayoutBinding(4, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute)
+            vk::DescriptorSetLayoutBinding(0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute), // GaussianBuffer
+            vk::DescriptorSetLayoutBinding(1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute), // SortKeyBuffer (src)
+            vk::DescriptorSetLayoutBinding(2, vk::DescriptorType::eUniformBuffer, 1, vk::ShaderStageFlagBits::eCompute), // CameraUBO
+            vk::DescriptorSetLayoutBinding(3, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute), // Gaussian2DBuffer
+            vk::DescriptorSetLayoutBinding(4, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute), // ImageBuffer
+            vk::DescriptorSetLayoutBinding(5, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute), // SortKeyBufferAlt (dst)
+            vk::DescriptorSetLayoutBinding(6, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute), // HistogramBuffer
+            vk::DescriptorSetLayoutBinding(7, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute)  // GlobalOffsetBuffer
         };
 
         vk::DescriptorSetLayoutCreateInfo layoutCreateInfo(
@@ -646,22 +681,22 @@ int main() {
 
         auto descriptorSetLayout = vulkanDevice.getDevice().createDescriptorSetLayoutUnique(layoutCreateInfo);
 
-        // 10. Descriptor pool
+        // 10. Descriptor pool (2 descriptor sets, 8 bindings each)
         std::vector<vk::DescriptorPoolSize> poolSizes = {
-            vk::DescriptorPoolSize(vk::DescriptorType::eStorageBuffer, 4),
-            vk::DescriptorPoolSize(vk::DescriptorType::eUniformBuffer, 1)
+            vk::DescriptorPoolSize(vk::DescriptorType::eStorageBuffer, 14),  // 7 storage buffers x 2 sets
+            vk::DescriptorPoolSize(vk::DescriptorType::eUniformBuffer, 2)    // 1 uniform buffer x 2 sets
         };
 
         vk::DescriptorPoolCreateInfo poolCreateInfo(
             vk::DescriptorPoolCreateFlags(),
-            1,
+            2,  // maxSets: mainDS + swapDS
             static_cast<uint32_t>(poolSizes.size()),
             poolSizes.data()
         );
 
         auto descriptorPool = vulkanDevice.getDevice().createDescriptorPoolUnique(poolCreateInfo);
 
-        // 11. Pipeline layout (push constants: 3 x uint32_t = 12 bytes for rasterize)
+        // 11. Pipeline layout (push constants: 3 x uint32_t = 12 bytes)
         vk::PushConstantRange pushConstantRange(
             vk::ShaderStageFlagBits::eCompute,
             0,
@@ -698,26 +733,64 @@ int main() {
         }
         auto computePipeline = std::move(computePipelineResult.value);
 
-        // 12b. bitonic_sort pipeline
-        std::string bitonicShaderPath = std::string(SHADER_DIR) + "/bitonic_sort.spv";
-        auto bitonicShaderCode = FileIO::readFile(bitonicShaderPath);
+        // 12b. radix_histogram pipeline
+        std::string radixHistogramShaderPath = std::string(SHADER_DIR) + "/radix_histogram.spv";
+        auto radixHistogramShaderCode = FileIO::readFile(radixHistogramShaderPath);
 
-        vk::ShaderModuleCreateInfo bitonicSMCI(vk::ShaderModuleCreateFlags(), bitonicShaderCode.size(),
-            reinterpret_cast<const uint32_t*>(bitonicShaderCode.data()));
-        auto bitonicShaderModule = vulkanDevice.getDevice().createShaderModuleUnique(bitonicSMCI);
+        vk::ShaderModuleCreateInfo radixHistogramSMCI(vk::ShaderModuleCreateFlags(), radixHistogramShaderCode.size(),
+            reinterpret_cast<const uint32_t*>(radixHistogramShaderCode.data()));
+        auto radixHistogramShaderModule = vulkanDevice.getDevice().createShaderModuleUnique(radixHistogramSMCI);
 
-        vk::PipelineShaderStageCreateInfo bitonicStageCI(
-            vk::PipelineShaderStageCreateFlags(), vk::ShaderStageFlagBits::eCompute, *bitonicShaderModule, "main");
-        vk::ComputePipelineCreateInfo bitonicPipelineCI(vk::PipelineCreateFlags(), bitonicStageCI, *pipelineLayout);
+        vk::PipelineShaderStageCreateInfo radixHistogramStageCI(
+            vk::PipelineShaderStageCreateFlags(), vk::ShaderStageFlagBits::eCompute, *radixHistogramShaderModule, "main");
+        vk::ComputePipelineCreateInfo radixHistogramPipelineCI(vk::PipelineCreateFlags(), radixHistogramStageCI, *pipelineLayout);
 
-        auto bitonicPipelineResult = vulkanDevice.getDevice().createComputePipelineUnique(nullptr, bitonicPipelineCI);
-        if (bitonicPipelineResult.result != vk::Result::eSuccess) {
-            throw std::runtime_error("Fatal: Failed to create bitonic sort compute pipeline.");
+        auto radixHistogramPipelineResult = vulkanDevice.getDevice().createComputePipelineUnique(nullptr, radixHistogramPipelineCI);
+        if (radixHistogramPipelineResult.result != vk::Result::eSuccess) {
+            throw std::runtime_error("Fatal: Failed to create radix histogram compute pipeline.");
         }
-        auto sortPipeline = std::move(bitonicPipelineResult.value);
-        std::cout << "[System] Bitonic sort pipeline created." << std::endl;
+        auto radixHistogramPipeline = std::move(radixHistogramPipelineResult.value);
+        std::cout << "[System] Radix histogram pipeline created." << std::endl;
 
-        // 12c. preprocess pipeline
+        // 12c. radix_scan pipeline
+        std::string radixScanShaderPath = std::string(SHADER_DIR) + "/radix_scan.spv";
+        auto radixScanShaderCode = FileIO::readFile(radixScanShaderPath);
+
+        vk::ShaderModuleCreateInfo radixScanSMCI(vk::ShaderModuleCreateFlags(), radixScanShaderCode.size(),
+            reinterpret_cast<const uint32_t*>(radixScanShaderCode.data()));
+        auto radixScanShaderModule = vulkanDevice.getDevice().createShaderModuleUnique(radixScanSMCI);
+
+        vk::PipelineShaderStageCreateInfo radixScanStageCI(
+            vk::PipelineShaderStageCreateFlags(), vk::ShaderStageFlagBits::eCompute, *radixScanShaderModule, "main");
+        vk::ComputePipelineCreateInfo radixScanPipelineCI(vk::PipelineCreateFlags(), radixScanStageCI, *pipelineLayout);
+
+        auto radixScanPipelineResult = vulkanDevice.getDevice().createComputePipelineUnique(nullptr, radixScanPipelineCI);
+        if (radixScanPipelineResult.result != vk::Result::eSuccess) {
+            throw std::runtime_error("Fatal: Failed to create radix scan compute pipeline.");
+        }
+        auto radixScanPipeline = std::move(radixScanPipelineResult.value);
+        std::cout << "[System] Radix scan pipeline created." << std::endl;
+
+        // 12d. radix_scatter pipeline
+        std::string radixScatterShaderPath = std::string(SHADER_DIR) + "/radix_scatter.spv";
+        auto radixScatterShaderCode = FileIO::readFile(radixScatterShaderPath);
+
+        vk::ShaderModuleCreateInfo radixScatterSMCI(vk::ShaderModuleCreateFlags(), radixScatterShaderCode.size(),
+            reinterpret_cast<const uint32_t*>(radixScatterShaderCode.data()));
+        auto radixScatterShaderModule = vulkanDevice.getDevice().createShaderModuleUnique(radixScatterSMCI);
+
+        vk::PipelineShaderStageCreateInfo radixScatterStageCI(
+            vk::PipelineShaderStageCreateFlags(), vk::ShaderStageFlagBits::eCompute, *radixScatterShaderModule, "main");
+        vk::ComputePipelineCreateInfo radixScatterPipelineCI(vk::PipelineCreateFlags(), radixScatterStageCI, *pipelineLayout);
+
+        auto radixScatterPipelineResult = vulkanDevice.getDevice().createComputePipelineUnique(nullptr, radixScatterPipelineCI);
+        if (radixScatterPipelineResult.result != vk::Result::eSuccess) {
+            throw std::runtime_error("Fatal: Failed to create radix scatter compute pipeline.");
+        }
+        auto radixScatterPipeline = std::move(radixScatterPipelineResult.value);
+        std::cout << "[System] Radix scatter pipeline created." << std::endl;
+
+        // 12e. preprocess pipeline
         std::string preprocessShaderPath = std::string(SHADER_DIR) + "/preprocess.spv";
         auto preprocessShaderCode = FileIO::readFile(preprocessShaderPath);
 
@@ -736,7 +809,7 @@ int main() {
         auto preprocessPipeline = std::move(preprocessPipelineResult.value);
         std::cout << "[System] Preprocess pipeline created." << std::endl;
 
-        // 12d. rasterize pipeline
+        // 12f. rasterize pipeline
         std::string rasterizeShaderPath = std::string(SHADER_DIR) + "/rasterize.spv";
         auto rasterizeShaderCode = FileIO::readFile(rasterizeShaderPath);
 
@@ -755,27 +828,45 @@ int main() {
         auto rasterizePipeline = std::move(rasterizePipelineResult.value);
         std::cout << "[System] Rasterize pipeline created." << std::endl;
 
-        // 13. Descriptor set
-        vk::DescriptorSetAllocateInfo descriptorSetAllocateInfo(*descriptorPool, 1, &*descriptorSetLayout);
+        // 13. Descriptor sets (2 sets: mainDS + swapDS for ping-pong radix sort)
+        std::vector<vk::DescriptorSetLayout> setLayouts = {*descriptorSetLayout, *descriptorSetLayout};
+        vk::DescriptorSetAllocateInfo descriptorSetAllocateInfo(*descriptorPool, static_cast<uint32_t>(setLayouts.size()), setLayouts.data());
         auto descriptorSets = vulkanDevice.getDevice().allocateDescriptorSets(descriptorSetAllocateInfo);
-        auto descriptorSet = descriptorSets[0];
+        auto mainDS = descriptorSets[0];
+        auto swapDS = descriptorSets[1];
 
         vk::DescriptorBufferInfo gaussianBufferInfo(gaussianBuffer.getBuffer(), 0, gaussianBufferSize);
         vk::DescriptorBufferInfo sortKeyBufferInfo(sortKeyBuffer.getBuffer(), 0, sortKeyBufferSize);
         vk::DescriptorBufferInfo cameraBufferInfo(cameraBuffer.getBuffer(), 0, sizeof(CameraUniform));
         vk::DescriptorBufferInfo gaussian2DBufferInfo(gaussian2DBuffer.getBuffer(), 0, gaussian2DBufferSize);
         vk::DescriptorBufferInfo imageBufferInfo(imageBuffer.getBuffer(), 0, imageBufferSize);
+        vk::DescriptorBufferInfo sortKeyBufferAltInfo(sortKeyBufferAlt.getBuffer(), 0, sortKeyBufferSize);
+        vk::DescriptorBufferInfo histogramBufferInfo(histogramBuffer.getBuffer(), 0, histogramBufferSize);
+        vk::DescriptorBufferInfo globalOffsetBufferInfo(globalOffsetBuffer.getBuffer(), 0, globalOffsetBufferSize);
 
-        std::vector<vk::WriteDescriptorSet> descriptorWrites = {
-            vk::WriteDescriptorSet(descriptorSet, 0, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &gaussianBufferInfo, nullptr),
-            vk::WriteDescriptorSet(descriptorSet, 1, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &sortKeyBufferInfo, nullptr),
-            vk::WriteDescriptorSet(descriptorSet, 2, 0, 1, vk::DescriptorType::eUniformBuffer, nullptr, &cameraBufferInfo, nullptr),
-            vk::WriteDescriptorSet(descriptorSet, 3, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &gaussian2DBufferInfo, nullptr),
-            vk::WriteDescriptorSet(descriptorSet, 4, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &imageBufferInfo, nullptr)
+        std::vector<vk::WriteDescriptorSet> allWrites = {
+            // mainDS: binding 1 = sortKeyBuffer (src), binding 5 = sortKeyBufferAlt (dst)
+            vk::WriteDescriptorSet(mainDS, 0, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &gaussianBufferInfo, nullptr),
+            vk::WriteDescriptorSet(mainDS, 1, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &sortKeyBufferInfo, nullptr),
+            vk::WriteDescriptorSet(mainDS, 2, 0, 1, vk::DescriptorType::eUniformBuffer, nullptr, &cameraBufferInfo, nullptr),
+            vk::WriteDescriptorSet(mainDS, 3, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &gaussian2DBufferInfo, nullptr),
+            vk::WriteDescriptorSet(mainDS, 4, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &imageBufferInfo, nullptr),
+            vk::WriteDescriptorSet(mainDS, 5, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &sortKeyBufferAltInfo, nullptr),
+            vk::WriteDescriptorSet(mainDS, 6, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &histogramBufferInfo, nullptr),
+            vk::WriteDescriptorSet(mainDS, 7, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &globalOffsetBufferInfo, nullptr),
+            // swapDS: binding 1 = sortKeyBufferAlt (src), binding 5 = sortKeyBuffer (dst) — SWAPPED
+            vk::WriteDescriptorSet(swapDS, 0, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &gaussianBufferInfo, nullptr),
+            vk::WriteDescriptorSet(swapDS, 1, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &sortKeyBufferAltInfo, nullptr),
+            vk::WriteDescriptorSet(swapDS, 2, 0, 1, vk::DescriptorType::eUniformBuffer, nullptr, &cameraBufferInfo, nullptr),
+            vk::WriteDescriptorSet(swapDS, 3, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &gaussian2DBufferInfo, nullptr),
+            vk::WriteDescriptorSet(swapDS, 4, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &imageBufferInfo, nullptr),
+            vk::WriteDescriptorSet(swapDS, 5, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &sortKeyBufferInfo, nullptr),
+            vk::WriteDescriptorSet(swapDS, 6, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &histogramBufferInfo, nullptr),
+            vk::WriteDescriptorSet(swapDS, 7, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &globalOffsetBufferInfo, nullptr),
         };
 
         vulkanDevice.getDevice().updateDescriptorSets(
-            static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data(), 0, nullptr);
+            static_cast<uint32_t>(allWrites.size()), allWrites.data(), 0, nullptr);
 
         // 14. Command buffer
         vk::CommandBufferAllocateInfo commandBufferAllocateInfo(*commandPool, vk::CommandBufferLevel::ePrimary, 1);
@@ -793,7 +884,7 @@ int main() {
 
         std::cout << "[System] Entering render loop..." << std::endl;
 
-        // ===== Phase 10: The Async Hot Loop (Fixed) =====
+        // ===== Phase 10: The Async Hot Loop (Radix Sort) =====
         while (!glfwWindowShouldClose(window.get())) {
             glfwPollEvents();
 
@@ -833,7 +924,7 @@ int main() {
             commandBuffer->begin(beginInfo);
 
             // Pad buffers
-            commandBuffer->fillBuffer(sortKeyBuffer.getBuffer(), 0, VK_WHOLE_SIZE, 0xBF800000);
+            commandBuffer->fillBuffer(sortKeyBuffer.getBuffer(), 0, VK_WHOLE_SIZE, ~0u);
             commandBuffer->fillBuffer(gaussian2DBuffer.getBuffer(), 0, VK_WHOLE_SIZE, 0);
 
             vk::MemoryBarrier fillBarrier(
@@ -846,7 +937,7 @@ int main() {
             // Dispatch calc_depth
             commandBuffer->bindPipeline(vk::PipelineBindPoint::eCompute, *computePipeline);
             commandBuffer->bindDescriptorSets(
-                vk::PipelineBindPoint::eCompute, *pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+                vk::PipelineBindPoint::eCompute, *pipelineLayout, 0, 1, &mainDS, 0, nullptr);
 
             uint32_t groupCountX = (static_cast<uint32_t>(pointData.size()) + 255) / 256;
             commandBuffer->dispatch(groupCountX, 1, 1);
@@ -858,24 +949,65 @@ int main() {
                 vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eComputeShader,
                 vk::DependencyFlags(), 1, &depthBarrier, 0, nullptr, 0, nullptr);
 
-            // Dispatch bitonic sort
-            commandBuffer->bindPipeline(vk::PipelineBindPoint::eCompute, *sortPipeline);
-            uint32_t sortGroupCountX = (paddedCount + 255) / 256;
-            for (uint32_t k = 2; k <= paddedCount; k <<= 1) {
-                for (uint32_t j = k / 2; j > 0; j >>= 1) {
-                    uint32_t pcData[2] = {k, j};
-                    commandBuffer->pushConstants<uint32_t>(
-                        *pipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, pcData);
-                    commandBuffer->dispatch(sortGroupCountX, 1, 1);
+            // ============================================================
+            // Radix Sort: 4 passes over 8-bit chunks (O(N) total)
+            // After 4 passes (even), sorted data resides in sortKeyBuffer.
+            // ============================================================
+            for (uint32_t pass = 0; pass < 4; pass++) {
+                uint32_t shift = pass * 8;
+                bool isEvenPass = (pass % 2 == 0);
+                vk::DescriptorSet currentDS = isEvenPass ? mainDS : swapDS;
 
-                    vk::MemoryBarrier sortBarrier(
-                        vk::AccessFlagBits::eShaderWrite,
-                        vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite);
-                    commandBuffer->pipelineBarrier(
-                        vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eComputeShader,
-                        vk::DependencyFlags(), 1, &sortBarrier, 0, nullptr, 0, nullptr);
-                }
+                // Bind the correct descriptor set for this pass (ping-pong)
+                commandBuffer->bindDescriptorSets(
+                    vk::PipelineBindPoint::eCompute, *pipelineLayout, 0, 1, &currentDS, 0, nullptr);
+
+                // --- Histogram Pass ---
+                commandBuffer->bindPipeline(vk::PipelineBindPoint::eCompute, *radixHistogramPipeline);
+                uint32_t histPC[3] = {shift, 0, 0};
+                commandBuffer->pushConstants<uint32_t>(
+                    *pipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, histPC);
+                commandBuffer->dispatch(histogramGroupCount, 1, 1);
+
+                vk::MemoryBarrier histBarrier(
+                    vk::AccessFlagBits::eShaderWrite,
+                    vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite);
+                commandBuffer->pipelineBarrier(
+                    vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eComputeShader,
+                    vk::DependencyFlags(), 1, &histBarrier, 0, nullptr, 0, nullptr);
+
+                // --- Scan Pass (single workgroup) ---
+                commandBuffer->bindPipeline(vk::PipelineBindPoint::eCompute, *radixScanPipeline);
+                uint32_t scanPC[3] = {histogramGroupCount, 0, 0};
+                commandBuffer->pushConstants<uint32_t>(
+                    *pipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, scanPC);
+                commandBuffer->dispatch(1, 1, 1);
+
+                vk::MemoryBarrier scanBarrier(
+                    vk::AccessFlagBits::eShaderWrite,
+                    vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite);
+                commandBuffer->pipelineBarrier(
+                    vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eComputeShader,
+                    vk::DependencyFlags(), 1, &scanBarrier, 0, nullptr, 0, nullptr);
+
+                // --- Scatter Pass ---
+                commandBuffer->bindPipeline(vk::PipelineBindPoint::eCompute, *radixScatterPipeline);
+                uint32_t scatterPC[3] = {shift, 0, 0};
+                commandBuffer->pushConstants<uint32_t>(
+                    *pipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, scatterPC);
+                commandBuffer->dispatch(histogramGroupCount, 1, 1);
+
+                vk::MemoryBarrier scatterBarrier(
+                    vk::AccessFlagBits::eShaderWrite,
+                    vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite);
+                commandBuffer->pipelineBarrier(
+                    vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eComputeShader,
+                    vk::DependencyFlags(), 1, &scatterBarrier, 0, nullptr, 0, nullptr);
             }
+
+            // Rebind mainDS for downstream shaders (sorted data is in sortKeyBuffer after 4 passes)
+            commandBuffer->bindDescriptorSets(
+                vk::PipelineBindPoint::eCompute, *pipelineLayout, 0, 1, &mainDS, 0, nullptr);
 
             // Dispatch preprocess
             vk::MemoryBarrier preprocessBarrier(

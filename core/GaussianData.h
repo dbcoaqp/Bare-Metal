@@ -14,7 +14,7 @@ static_assert(sizeof(GaussianPoint) == 48, "GaussianPoint must be exactly 48 byt
 static_assert(alignof(GaussianPoint) == 16, "GaussianPoint must have 16-byte alignment");
 
 struct alignas(8) SortKeyPair {
-    float depth;
+    uint32_t key;
     uint32_t index;
 };
 
