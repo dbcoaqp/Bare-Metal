@@ -782,10 +782,6 @@ int main() {
         auto commandBuffers = vulkanDevice.getDevice().allocateCommandBuffersUnique(commandBufferAllocateInfo);
         auto commandBuffer = std::move(commandBuffers[0]);
 
-        // Acquire fence for swapchain image acquisition
-        vk::FenceCreateInfo acquireFenceInfo(vk::FenceCreateFlagBits::eSignaled);
-        auto acquireFence = vulkanDevice.getDevice().createFenceUnique(acquireFenceInfo);
-
         // Phase 10: Vulkan traffic lights (semaphores)
         vk::SemaphoreCreateInfo semaphoreCreateInfo;
         auto imageAvailableSemaphore = vulkanDevice.getDevice().createSemaphoreUnique(semaphoreCreateInfo);
@@ -797,15 +793,15 @@ int main() {
 
         std::cout << "[System] Entering render loop..." << std::endl;
 
-        // ===== Phase 10: The Async Hot Loop =====
+        // ===== Phase 10: The Async Hot Loop (Fixed) =====
         while (!glfwWindowShouldClose(window.get())) {
+            glfwPollEvents();
+
+            // Wait for previous frame's GPU work to complete
             VK_CHECK(vulkanDevice.getDevice().waitForFences(*renderFence, VK_TRUE, UINT64_MAX));
             vulkanDevice.getDevice().resetFences(*renderFence);
 
-            auto acqResult = vulkanDevice.getDevice().acquireNextImageKHR(*swapchain, UINT64_MAX, *imageAvailableSemaphore, nullptr);
-            glfwPollEvents();
-
-            // (a)(b) Dynamic camera update from mouse input
+            // Update camera from mouse input
             float radYaw = yaw * PI / 180.0f;
             float radPitch = pitch * PI / 180.0f;
             float fwdX = std::cos(radPitch) * std::cos(radYaw);
@@ -825,20 +821,13 @@ int main() {
                 fwdX, fwdY, fwdZ, WIDTH, HEIGHT);
             cameraBuffer.flush();
 
-            // (c) Acquire next swapchain image with semaphore and fence
-            VK_CHECK(vulkanDevice.getDevice().waitForFences(*acquireFence, VK_TRUE, UINT64_MAX));
-            vulkanDevice.getDevice().resetFences(*acquireFence);
-
+            // Acquire swapchain image (semaphore signals when available)
             auto acqResult = vulkanDevice.getDevice().acquireNextImageKHR(
-                *swapchain, UINT64_MAX, *imageAvailableSemaphore, *acquireFence);
+                *swapchain, UINT64_MAX, *imageAvailableSemaphore, nullptr);
             VK_CHECK(acqResult.result);
             uint32_t imageIndex = acqResult.value;
 
-            // (d) Wait for acquire, then reset fence for submit use
-            VK_CHECK(vulkanDevice.getDevice().waitForFences(*acquireFence, VK_TRUE, UINT64_MAX));
-            vulkanDevice.getDevice().resetFences(*acquireFence);
-
-            // (e) Record command buffer
+            // Record command buffer
             commandBuffer->reset(vk::CommandBufferResetFlags());
             vk::CommandBufferBeginInfo beginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
             commandBuffer->begin(beginInfo);
@@ -963,7 +952,7 @@ int main() {
 
             commandBuffer->end();
 
-            // (f)(g) Submit with semaphore synchronization — NO waitIdle!
+            // Single submit: wait on imageAvailableSemaphore, signal renderFinishedSemaphore + renderFence
             vk::Semaphore waitSemaphores[] = {*imageAvailableSemaphore};
             vk::PipelineStageFlags waitStages[] = {vk::PipelineStageFlagBits::eTransfer};
             vk::Semaphore signalSemaphores[] = {*renderFinishedSemaphore};
@@ -973,10 +962,9 @@ int main() {
                 1, &*commandBuffer,
                 1, signalSemaphores
             );
-            VK_CHECK(vulkanDevice.getComputeQueue().submit(1, &submitInfo, *acquireFence));
             VK_CHECK(vulkanDevice.getComputeQueue().submit(1, &submitInfo, *renderFence));
 
-            // (h) Present with semaphore wait (display must wait for GPU to finish)
+            // Present: wait on renderFinishedSemaphore before displaying
             vk::PresentInfoKHR presentInfo(
                 1, signalSemaphores,
                 1, &*swapchain,
