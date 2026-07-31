@@ -871,18 +871,28 @@ int main() {
             static_cast<uint32_t>(allWrites.size()), allWrites.data(), 0, nullptr);
 
         // 14. Command buffer
-        vk::CommandBufferAllocateInfo commandBufferAllocateInfo(*commandPool, vk::CommandBufferLevel::ePrimary, 1);
+        const int MAX_FRAMES_IN_FLIGHT = 2;
+        vk::CommandBufferAllocateInfo commandBufferAllocateInfo(*commandPool, vk::CommandBufferLevel::ePrimary, MAX_FRAMES_IN_FLIGHT);
         auto commandBuffers = vulkanDevice.getDevice().allocateCommandBuffersUnique(commandBufferAllocateInfo);
         auto commandBuffer = std::move(commandBuffers[0]);
 
         // Phase 10: Vulkan traffic lights (semaphores)
-        vk::SemaphoreCreateInfo semaphoreCreateInfo;
-        auto imageAvailableSemaphore = vulkanDevice.getDevice().createSemaphoreUnique(semaphoreCreateInfo);
-        auto renderFinishedSemaphore = vulkanDevice.getDevice().createSemaphoreUnique(semaphoreCreateInfo);
-        std::cout << "[System] Synchronization semaphores created." << std::endl;
+        std::vector<vk::UniqueSemaphore> imageAvailableSemaphores;
+        std::vector<vk::UniqueSemaphore> renderFinishedSemaphores;
+        std::vector<vk::UniqueFence> renderFences;
 
+        vk::SemaphoreCreateInfo semaphoreCreateInfo;
         vk::FenceCreateInfo renderFenceInfo(vk::FenceCreateFlagBits::eSignaled);
-        auto renderFence = vulkanDevice.getDevice().createFenceUnique(renderFenceInfo);
+
+        for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+            imageAvailableSemaphores.push_back(vulkanDevice.getDevice().createSemaphoreUnique(semaphoreCreateInfo));
+            renderFinishedSemaphores.push_back(vulkanDevice.getDevice().createSemaphoreUnique(semaphoreCreateInfo));
+            renderFences.push_back(vulkanDevice.getDevice().createFenceUnique(renderFenceInfo));
+        }
+        eateFenceUnique(renderFenceInfo);
+
+        uint32_t currentFrame = 0;
+        std::cout << "[System] " << MAX_FRAMES_IN_FLIGHT << " sets of Synchronization traffic lights created." << std::endl;
 
         std::cout << "[System] Entering render loop..." << std::endl;
 
@@ -890,9 +900,9 @@ int main() {
         while (!glfwWindowShouldClose(window.get())) {
             glfwPollEvents();
 
-            // Wait for previous frame's GPU work to complete
-            VK_CHECK(vulkanDevice.getDevice().waitForFences(*renderFence, VK_TRUE, UINT64_MAX));
-            vulkanDevice.getDevice().resetFences(*renderFence);
+            // Wait for the specific frame's GPU work to complete
+            VK_CHECK(vulkanDevice.getDevice().waitForFences(*renderFences[currentFrame], VK_TRUE, UINT64_MAX));
+            vulkanDevice.getDevice().resetFences(*renderFences[currentFrame]);
 
             // Update camera from mouse input
             float radYaw = yaw * PI / 180.0f;
@@ -916,9 +926,12 @@ int main() {
 
             // Acquire swapchain image (semaphore signals when available)
             auto acqResult = vulkanDevice.getDevice().acquireNextImageKHR(
-                *swapchain, UINT64_MAX, *imageAvailableSemaphore, nullptr);
+                *swapchain, UINT64_MAX, *imageAvailableSemaphores[currentFrame], nullptr);
             VK_CHECK(acqResult.result);
             uint32_t imageIndex = acqResult.value;
+
+            // Extract the command scroll specific to the current frame
+            auto& commandBuffer = commandBuffers[currentFrame];
 
             // Record command buffer
             commandBuffer->reset(vk::CommandBufferResetFlags());
@@ -1105,16 +1118,16 @@ int main() {
             commandBuffer->end();
 
             // Single submit: wait on imageAvailableSemaphore, signal renderFinishedSemaphore + renderFence
-            vk::Semaphore waitSemaphores[] = {*imageAvailableSemaphore};
+            vk::Semaphore waitSemaphores[] = {*imageAvailableSemaphores[currentFrame]};
             vk::PipelineStageFlags waitStages[] = {vk::PipelineStageFlagBits::eTransfer};
-            vk::Semaphore signalSemaphores[] = {*renderFinishedSemaphore};
+            vk::Semaphore signalSemaphores[] = {*renderFinishedSemaphores[currentFrame]};
 
             vk::SubmitInfo submitInfo(
                 1, waitSemaphores, waitStages,
                 1, &*commandBuffer,
                 1, signalSemaphores
             );
-            VK_CHECK(vulkanDevice.getComputeQueue().submit(1, &submitInfo, *renderFence));
+            VK_CHECK(vulkanDevice.getComputeQueue().submit(1, &submitInfo, *renderFences[currentFrame]));
 
             // Present: wait on renderFinishedSemaphore before displaying
             vk::PresentInfoKHR presentInfo(
@@ -1124,6 +1137,8 @@ int main() {
                 nullptr
             );
             (void)vulkanDevice.getComputeQueue().presentKHR(presentInfo);
+
+            currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
         }
 
         std::cout << "[System] Render loop exited. Shutting down..." << std::endl;
