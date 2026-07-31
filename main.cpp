@@ -19,6 +19,8 @@
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
+#include <nvtx3/nvToolsExt.h>
+
 #include "utils/FileIO.h"
 #include "utils/VkCheck.h"
 #include "core/VmaBuffer.h"
@@ -923,6 +925,9 @@ int main() {
             vk::CommandBufferBeginInfo beginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
             commandBuffer->begin(beginInfo);
 
+            // ====== Stage A: Buffer Pad & Depth Calc ======
+            nvtxRangePushA("1. Buffer Pad & Depth Calc");
+
             // Pad buffers
             commandBuffer->fillBuffer(sortKeyBuffer.getBuffer(), 0, VK_WHOLE_SIZE, ~0u);
             commandBuffer->fillBuffer(gaussian2DBuffer.getBuffer(), 0, VK_WHOLE_SIZE, 0);
@@ -948,6 +953,11 @@ int main() {
             commandBuffer->pipelineBarrier(
                 vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eComputeShader,
                 vk::DependencyFlags(), 1, &depthBarrier, 0, nullptr, 0, nullptr);
+
+            nvtxRangePop();
+
+            // ====== Stage B: Radix Sort O(N) ======
+            nvtxRangePushA("2. Radix Sort O(N)");
 
             // ============================================================
             // Radix Sort: 4 passes over 8-bit chunks (O(N) total)
@@ -1009,7 +1019,11 @@ int main() {
             commandBuffer->bindDescriptorSets(
                 vk::PipelineBindPoint::eCompute, *pipelineLayout, 0, 1, &mainDS, 0, nullptr);
 
-            // Dispatch preprocess
+            nvtxRangePop();
+
+            // ====== Stage C: Covariance Preprocess ======
+            nvtxRangePushA("3. Covariance Preprocess");
+
             vk::MemoryBarrier preprocessBarrier(
                 vk::AccessFlagBits::eShaderWrite,
                 vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite);
@@ -1021,7 +1035,11 @@ int main() {
             uint32_t preprocessGroupCountX = (paddedCount + 255) / 256;
             commandBuffer->dispatch(preprocessGroupCountX, 1, 1);
 
-            // Dispatch rasterize
+            nvtxRangePop();
+
+            // ====== Stage D: Compute Rasterization ======
+            nvtxRangePushA("4. Compute Rasterization");
+
             vk::MemoryBarrier rasterizeBarrier(
                 vk::AccessFlagBits::eShaderWrite,
                 vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite);
@@ -1081,6 +1099,8 @@ int main() {
             commandBuffer->pipelineBarrier(
                 vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eBottomOfPipe,
                 vk::DependencyFlags(), 0, nullptr, 0, nullptr, 1, &toPresentSrc);
+
+            nvtxRangePop();
 
             commandBuffer->end();
 

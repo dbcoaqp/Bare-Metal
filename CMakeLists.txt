@@ -91,6 +91,9 @@ include_directories(${CMAKE_SOURCE_DIR})
 include_directories(${CMAKE_SOURCE_DIR}/utils)
 include_directories(${CMAKE_SOURCE_DIR}/core)
 
+# NVTX v3 is header-only — add its default install path for Nsight Systems profiling
+include_directories("C:/Program Files/NVIDIA Corporation/NvToolsExt/include")
+
 add_executable(BareMetalComputeProbe main.cpp)
 add_dependencies(BareMetalComputeProbe CompileShaders)
 
