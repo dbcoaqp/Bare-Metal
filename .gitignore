@@ -71,5 +71,6 @@ Testing/
 
 .DS_Store
 .py
+.ply
 
 /docs
