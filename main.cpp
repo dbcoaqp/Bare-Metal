@@ -889,7 +889,7 @@ int main() {
             renderFinishedSemaphores.push_back(vulkanDevice.getDevice().createSemaphoreUnique(semaphoreCreateInfo));
             renderFences.push_back(vulkanDevice.getDevice().createFenceUnique(renderFenceInfo));
         }
-        eateFenceUnique(renderFenceInfo);
+        
 
         uint32_t currentFrame = 0;
         std::cout << "[System] " << MAX_FRAMES_IN_FLIGHT << " sets of Synchronization traffic lights created." << std::endl;
@@ -927,7 +927,9 @@ int main() {
             // Acquire swapchain image (semaphore signals when available)
             auto acqResult = vulkanDevice.getDevice().acquireNextImageKHR(
                 *swapchain, UINT64_MAX, *imageAvailableSemaphores[currentFrame], nullptr);
-            VK_CHECK(acqResult.result);
+            if (acqResult.result != vk::Result::eSuccess && acqResult.result != vk::Result::eSuboptimalKHR) {
+                VK_CHECK(acqResult.result);
+            }
             uint32_t imageIndex = acqResult.value;
 
             // Extract the command scroll specific to the current frame
@@ -1143,7 +1145,6 @@ int main() {
 
         std::cout << "[System] Render loop exited. Shutting down..." << std::endl;
         vulkanDevice.getDevice().waitIdle();
-        cameraBuffer.unmap();
 
     } catch (const std::exception& e) {
         std::cerr << "Critical Error: " << e.what() << std::endl;
