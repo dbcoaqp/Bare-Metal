@@ -19,7 +19,7 @@
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
-#include <nvtx3/nvToolsExt.h>
+#include <nvToolsExt.h>
 
 #include "utils/FileIO.h"
 #include "utils/VkCheck.h"
@@ -330,6 +330,7 @@ public:
         const std::vector<const char*> validationLayers = {
             "VK_LAYER_KHRONOS_validation"
         };
+        const std::vector<const char*> validationLayers = {};
 
         auto availableLayers = vk::enumerateInstanceLayerProperties();
         for (const char* layerName : validationLayers) {
@@ -872,9 +873,10 @@ int main() {
 
         // 14. Command buffer
         const int MAX_FRAMES_IN_FLIGHT = 2;
+        const uint32_t MAX_FRAMES_IN_FLIGHT = static_cast<uint32_t>(swapchainImages.size());
         vk::CommandBufferAllocateInfo commandBufferAllocateInfo(*commandPool, vk::CommandBufferLevel::ePrimary, MAX_FRAMES_IN_FLIGHT);
         auto commandBuffers = vulkanDevice.getDevice().allocateCommandBuffersUnique(commandBufferAllocateInfo);
-        auto commandBuffer = std::move(commandBuffers[0]);
+        //auto commandBuffer = std::move(commandBuffers[0]);
 
         // Phase 10: Vulkan traffic lights (semaphores)
         std::vector<vk::UniqueSemaphore> imageAvailableSemaphores;
@@ -1063,7 +1065,8 @@ int main() {
                 vk::DependencyFlags(), 1, &rasterizeBarrier, 0, nullptr, 0, nullptr);
 
             commandBuffer->bindPipeline(vk::PipelineBindPoint::eCompute, *rasterizePipeline);
-            uint32_t rasterizePC[3] = {static_cast<uint32_t>(pointData.size()), WIDTH, HEIGHT};
+            //uint32_t rasterizePC[3] = {static_cast<uint32_t>(pointData.size()), WIDTH, HEIGHT};
+            uint32_t rasterizePC[3] = { 30000, WIDTH, HEIGHT };
             commandBuffer->pushConstants<uint32_t>(
                 *pipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, rasterizePC);
             uint32_t rasterizeGroupCountX = (WIDTH + 15) / 16;

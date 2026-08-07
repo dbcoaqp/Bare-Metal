@@ -93,6 +93,7 @@ include_directories(${CMAKE_SOURCE_DIR}/core)
 
 # NVTX v3 is header-only — add its default install path for Nsight Systems profiling
 include_directories("C:/Program Files/NVIDIA Corporation/NvToolsExt/include")
+link_directories("C:/Program Files/NVIDIA Corporation/NvToolsExt/lib/x64")
 
 add_executable(BareMetalComputeProbe main.cpp)
 add_dependencies(BareMetalComputeProbe CompileShaders)
@@ -101,4 +102,4 @@ target_compile_definitions(BareMetalComputeProbe PRIVATE
     VULKAN_HPP_DISPATCH_LOADER_DYNAMIC=1
     SHADER_DIR="${CMAKE_SOURCE_DIR}/shaders"
 )
-target_link_libraries(BareMetalComputeProbe PRIVATE Vulkan::Vulkan VulkanMemoryAllocator glfw)
+target_link_libraries(BareMetalComputeProbe PRIVATE Vulkan::Vulkan VulkanMemoryAllocator glfw nvToolsExt64_1.lib)
