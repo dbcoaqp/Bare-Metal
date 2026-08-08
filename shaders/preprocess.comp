@@ -161,8 +161,8 @@ void main() {
 
     uint min_tx = uint(clamp(floor(minPixel.x / 16.0), 0.0, tileMaxX));
     uint min_ty = uint(clamp(floor(minPixel.y / 16.0), 0.0, tileMaxY));
-    uint max_tx = uint(clamp(floor(maxPixel.x / 16.0), 0.0, tileMaxX));
-    uint max_ty = uint(clamp(floor(maxPixel.y / 16.0), 0.0, tileMaxY));
+    uint max_tx = uint(clamp(ceil(maxPixel.x / 16.0), 0.0, tileMaxX));
+    uint max_ty = uint(clamp(ceil(maxPixel.y / 16.0), 0.0, tileMaxY));
 
     // 7. Invert 2D covariance to get conic (a, b, c)
     float det = sigma_xx * sigma_yy - sigma_xy * sigma_xy;
