@@ -21,6 +21,7 @@ struct Gaussian2D {
     vec3 conic;
     float pad1;
     vec3 color;
+    uint bounds[4];     // min_tx, min_ty, max_tx, max_ty
     float pad2;
 };
 
@@ -46,6 +47,11 @@ layout(std140, binding = 2) uniform CameraUBO {
 
 layout(std430, binding = 3) buffer Gaussian2DBuffer {
     Gaussian2D gaussians2D[];
+};
+
+// Phase 13: Touched tiles output buffer
+layout(std430, binding = 8) buffer TouchedTilesBuffer {
+    uint touchedTiles[];
 };
 
 // Build rotation matrix from quaternion (w, x, y, z)
@@ -89,7 +95,12 @@ void main() {
         gaussians2D[idx].conic = vec3(0.0);
         gaussians2D[idx].pad1 = 0.0;
         gaussians2D[idx].color = vec3(0.0);
+        gaussians2D[idx].bounds[0] = 0u;
+        gaussians2D[idx].bounds[1] = 0u;
+        gaussians2D[idx].bounds[2] = 0u;
+        gaussians2D[idx].bounds[3] = 0u;
         gaussians2D[idx].pad2 = 0.0;
+        touchedTiles[idx] = 0u;
         return;
     }
 
@@ -102,10 +113,10 @@ void main() {
     // float s = gp.scale;
 
     // shrunk by 20 to prevent the test data from being too large and filling the screen.
-    float s = gp.scale * 0.05; 
+    float s = gp.scale * 0.05;
 
     // forced them to be red to eliminate the interference if NPY is gray.
-    gp.color = vec3(1.0, 0.2, 0.2); 
+    gp.color = vec3(1.0, 0.2, 0.2);
 
     // 5. Compute the Jacobian of the full viewProj -> screen transformation
     //    This directly computes T = J * W (projection Jacobian * view rotation)
@@ -130,6 +141,29 @@ void main() {
     float sigma_xy = dot(v0, v1);
     float sigma_yy = dot(v1, v1);
 
+    // ============================================================
+    // Phase 13: Compute 2D ellipse pixel radius from eigenvalues
+    // ============================================================
+    float det_cov = sigma_xx * sigma_yy - sigma_xy * sigma_xy;
+    float mid = 0.5 * (sigma_xx + sigma_yy);
+    float discriminant = mid * mid - det_cov;
+    float lambda1 = mid + sqrt(max(0.1, discriminant));
+    float lambda2 = mid - sqrt(max(0.1, discriminant));
+    float radius = ceil(3.0 * sqrt(max(lambda1, lambda2)));
+
+    // Pixel bounding box
+    vec2 minPixel = pos2D - vec2(radius);
+    vec2 maxPixel = pos2D + vec2(radius);
+
+    // Convert to tile grid coordinates (tile size = 16 pixels, floor division)
+    float tileMaxX = viewport.x / 16.0;
+    float tileMaxY = viewport.y / 16.0;
+
+    uint min_tx = uint(clamp(floor(minPixel.x / 16.0), 0.0, tileMaxX));
+    uint min_ty = uint(clamp(floor(minPixel.y / 16.0), 0.0, tileMaxY));
+    uint max_tx = uint(clamp(floor(maxPixel.x / 16.0), 0.0, tileMaxX));
+    uint max_ty = uint(clamp(floor(maxPixel.y / 16.0), 0.0, tileMaxY));
+
     // 7. Invert 2D covariance to get conic (a, b, c)
     float det = sigma_xx * sigma_yy - sigma_xy * sigma_xy;
 
@@ -150,5 +184,13 @@ void main() {
     gaussians2D[idx].conic = conic;
     gaussians2D[idx].pad1 = 0.0;
     gaussians2D[idx].color = gp.color;
+    gaussians2D[idx].bounds[0] = min_tx;
+    gaussians2D[idx].bounds[1] = min_ty;
+    gaussians2D[idx].bounds[2] = max_tx;
+    gaussians2D[idx].bounds[3] = max_ty;
     gaussians2D[idx].pad2 = 0.0;
+
+    // Phase 13: Write touched tile count
+    uint touchedCount = (max_tx - min_tx) * (max_ty - min_ty);
+    touchedTiles[idx] = touchedCount;
 }

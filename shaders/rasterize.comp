@@ -8,6 +8,7 @@ struct Gaussian2D {
     vec3 conic;
     float pad1;
     vec3 color;
+    uint bounds[4];     // min_tx, min_ty, max_tx, max_ty
     float pad2;
 };
 

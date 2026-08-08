@@ -330,7 +330,6 @@ public:
         const std::vector<const char*> validationLayers = {
             "VK_LAYER_KHRONOS_validation"
         };
-        const std::vector<const char*> validationLayers = {};
 
         auto availableLayers = vk::enumerateInstanceLayerProperties();
         for (const char* layerName : validationLayers) {
@@ -656,6 +655,16 @@ int main() {
         );
         std::cout << "[System] Radix global offset buffer created (" << globalOffsetBufferSize << " bytes)." << std::endl;
 
+        // 7g. Touched tiles buffer for Phase 13 tile bounding box verification
+        vk::DeviceSize touchedTilesBufferSize = static_cast<vk::DeviceSize>(paddedCount) * sizeof(uint32_t);
+        VmaBuffer touchedTilesBuffer(
+            vulkanDevice.getAllocator(),
+            touchedTilesBufferSize,
+            vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc,
+            VMA_MEMORY_USAGE_GPU_ONLY
+        );
+        std::cout << "[System] Touched tiles buffer created (" << touchedTilesBufferSize << " bytes)." << std::endl;
+
         // 8. Shader module
         vk::ShaderModuleCreateInfo shaderModuleCreateInfo(
             vk::ShaderModuleCreateFlags(),
@@ -664,7 +673,7 @@ int main() {
         );
         auto shaderModule = vulkanDevice.getDevice().createShaderModuleUnique(shaderModuleCreateInfo);
 
-        // 9. Descriptor set layout (8 bindings: original 5 + radix sort 3)
+        // 9. Descriptor set layout (9 bindings: original 7 + radix sort 1 + touched tiles)
         std::vector<vk::DescriptorSetLayoutBinding> layoutBindings = {
             vk::DescriptorSetLayoutBinding(0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute), // GaussianBuffer
             vk::DescriptorSetLayoutBinding(1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute), // SortKeyBuffer (src)
@@ -673,7 +682,8 @@ int main() {
             vk::DescriptorSetLayoutBinding(4, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute), // ImageBuffer
             vk::DescriptorSetLayoutBinding(5, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute), // SortKeyBufferAlt (dst)
             vk::DescriptorSetLayoutBinding(6, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute), // HistogramBuffer
-            vk::DescriptorSetLayoutBinding(7, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute)  // GlobalOffsetBuffer
+            vk::DescriptorSetLayoutBinding(7, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute), // GlobalOffsetBuffer
+            vk::DescriptorSetLayoutBinding(8, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute)  // TouchedTilesBuffer
         };
 
         vk::DescriptorSetLayoutCreateInfo layoutCreateInfo(
@@ -684,9 +694,9 @@ int main() {
 
         auto descriptorSetLayout = vulkanDevice.getDevice().createDescriptorSetLayoutUnique(layoutCreateInfo);
 
-        // 10. Descriptor pool (2 descriptor sets, 8 bindings each)
+        // 10. Descriptor pool (2 descriptor sets, 9 bindings each)
         std::vector<vk::DescriptorPoolSize> poolSizes = {
-            vk::DescriptorPoolSize(vk::DescriptorType::eStorageBuffer, 14),  // 7 storage buffers x 2 sets
+            vk::DescriptorPoolSize(vk::DescriptorType::eStorageBuffer, 16),  // 8 storage buffers x 2 sets
             vk::DescriptorPoolSize(vk::DescriptorType::eUniformBuffer, 2)    // 1 uniform buffer x 2 sets
         };
 
@@ -846,6 +856,7 @@ int main() {
         vk::DescriptorBufferInfo sortKeyBufferAltInfo(sortKeyBufferAlt.getBuffer(), 0, sortKeyBufferSize);
         vk::DescriptorBufferInfo histogramBufferInfo(histogramBuffer.getBuffer(), 0, histogramBufferSize);
         vk::DescriptorBufferInfo globalOffsetBufferInfo(globalOffsetBuffer.getBuffer(), 0, globalOffsetBufferSize);
+        vk::DescriptorBufferInfo touchedTilesBufferInfo(touchedTilesBuffer.getBuffer(), 0, touchedTilesBufferSize);
 
         std::vector<vk::WriteDescriptorSet> allWrites = {
             // mainDS: binding 1 = sortKeyBuffer (src), binding 5 = sortKeyBufferAlt (dst)
@@ -857,6 +868,7 @@ int main() {
             vk::WriteDescriptorSet(mainDS, 5, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &sortKeyBufferAltInfo, nullptr),
             vk::WriteDescriptorSet(mainDS, 6, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &histogramBufferInfo, nullptr),
             vk::WriteDescriptorSet(mainDS, 7, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &globalOffsetBufferInfo, nullptr),
+            vk::WriteDescriptorSet(mainDS, 8, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &touchedTilesBufferInfo, nullptr),
             // swapDS: binding 1 = sortKeyBufferAlt (src), binding 5 = sortKeyBuffer (dst) — SWAPPED
             vk::WriteDescriptorSet(swapDS, 0, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &gaussianBufferInfo, nullptr),
             vk::WriteDescriptorSet(swapDS, 1, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &sortKeyBufferAltInfo, nullptr),
@@ -866,17 +878,16 @@ int main() {
             vk::WriteDescriptorSet(swapDS, 5, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &sortKeyBufferInfo, nullptr),
             vk::WriteDescriptorSet(swapDS, 6, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &histogramBufferInfo, nullptr),
             vk::WriteDescriptorSet(swapDS, 7, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &globalOffsetBufferInfo, nullptr),
+            vk::WriteDescriptorSet(swapDS, 8, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &touchedTilesBufferInfo, nullptr),
         };
 
         vulkanDevice.getDevice().updateDescriptorSets(
             static_cast<uint32_t>(allWrites.size()), allWrites.data(), 0, nullptr);
 
         // 14. Command buffer
-        const int MAX_FRAMES_IN_FLIGHT = 2;
         const uint32_t MAX_FRAMES_IN_FLIGHT = static_cast<uint32_t>(swapchainImages.size());
         vk::CommandBufferAllocateInfo commandBufferAllocateInfo(*commandPool, vk::CommandBufferLevel::ePrimary, MAX_FRAMES_IN_FLIGHT);
         auto commandBuffers = vulkanDevice.getDevice().allocateCommandBuffersUnique(commandBufferAllocateInfo);
-        //auto commandBuffer = std::move(commandBuffers[0]);
 
         // Phase 10: Vulkan traffic lights (semaphores)
         std::vector<vk::UniqueSemaphore> imageAvailableSemaphores;
@@ -886,7 +897,7 @@ int main() {
         vk::SemaphoreCreateInfo semaphoreCreateInfo;
         vk::FenceCreateInfo renderFenceInfo(vk::FenceCreateFlagBits::eSignaled);
 
-        for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
             imageAvailableSemaphores.push_back(vulkanDevice.getDevice().createSemaphoreUnique(semaphoreCreateInfo));
             renderFinishedSemaphores.push_back(vulkanDevice.getDevice().createSemaphoreUnique(semaphoreCreateInfo));
             renderFences.push_back(vulkanDevice.getDevice().createFenceUnique(renderFenceInfo));
@@ -948,6 +959,7 @@ int main() {
             // Pad buffers
             commandBuffer->fillBuffer(sortKeyBuffer.getBuffer(), 0, VK_WHOLE_SIZE, ~0u);
             commandBuffer->fillBuffer(gaussian2DBuffer.getBuffer(), 0, VK_WHOLE_SIZE, 0);
+            commandBuffer->fillBuffer(touchedTilesBuffer.getBuffer(), 0, VK_WHOLE_SIZE, 0);
 
             vk::MemoryBarrier fillBarrier(
                 vk::AccessFlagBits::eTransferWrite,
@@ -1148,6 +1160,53 @@ int main() {
 
         std::cout << "[System] Render loop exited. Shutting down..." << std::endl;
         vulkanDevice.getDevice().waitIdle();
+
+        // ============================================================
+        // Phase 13: Reverse DMA - Readback touchedTilesBuffer to CPU
+        // ============================================================
+        {
+            VmaBuffer touchedTilesReadback(
+                vulkanDevice.getAllocator(),
+                touchedTilesBufferSize,
+                vk::BufferUsageFlagBits::eTransferDst,
+                VMA_MEMORY_USAGE_GPU_TO_CPU
+            );
+
+            vk::CommandBufferAllocateInfo readbackCmdBufInfo(
+                *commandPool, vk::CommandBufferLevel::ePrimary, 1);
+            auto readbackCmdBuffers = vulkanDevice.getDevice().allocateCommandBuffersUnique(readbackCmdBufInfo);
+            auto& readbackCmdBuffer = readbackCmdBuffers[0];
+
+            vk::CommandBufferBeginInfo readbackBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
+            readbackCmdBuffer->begin(readbackBeginInfo);
+
+            vk::BufferCopy readbackCopyRegion(0, 0, touchedTilesBufferSize);
+            readbackCmdBuffer->copyBuffer(
+                touchedTilesBuffer.getBuffer(),
+                touchedTilesReadback.getBuffer(),
+                readbackCopyRegion
+            );
+
+            readbackCmdBuffer->end();
+
+            vk::SubmitInfo readbackSubmitInfo(0, nullptr, nullptr, 1, &*readbackCmdBuffer, 0, nullptr);
+            VK_CHECK(vulkanDevice.getComputeQueue().submit(1, &readbackSubmitInfo, nullptr));
+            vulkanDevice.getComputeQueue().waitIdle();
+
+            uint32_t* touchedData = static_cast<uint32_t*>(touchedTilesReadback.map());
+
+            std::cout << "\n[System] === Touched Tiles Verification ===" << std::endl;
+            std::cout << "[System] Total gaussians: " << pointData.size()
+                      << ", Padded count: " << paddedCount << std::endl;
+
+            uint32_t printCount = std::min(static_cast<uint32_t>(10), static_cast<uint32_t>(pointData.size()));
+            for (uint32_t i = 0; i < printCount; ++i) {
+                std::cout << "[System] Gaussian[" << i << "]: touchedTiles = " << touchedData[i] << std::endl;
+            }
+            std::cout << "[System] === Touched Tiles Verification Complete ===" << std::endl;
+
+            touchedTilesReadback.unmap();
+        }
 
     } catch (const std::exception& e) {
         std::cerr << "Critical Error: " << e.what() << std::endl;

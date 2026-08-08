@@ -46,8 +46,8 @@ void main() {
     
     // IEEE 754 float-to-sortable-uint transformation for ascending depth order
     uint depthKey = floatBitsToUint(depth);
-    // Positive: flip sign bit; Negative: flip all bits
-    depthKey = (depthKey & 0x80000000u) == 0u ? (~depthKey) : (depthKey ^ 0x80000000u);
+    // Negative (sign bit=1): flip all bits; Positive (sign bit=0): flip sign bit
+    depthKey = (depthKey & 0x80000000u) != 0u ? (~depthKey) : (depthKey ^ 0x80000000u);
     
     sortKeys[index].key = depthKey;
     sortKeys[index].index = index;
