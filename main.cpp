@@ -19,7 +19,10 @@
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
-#include <nvToolsExt.h>
+#include <nvtx3/nvToolsExt.h>
+#ifdef MemoryBarrier
+#undef MemoryBarrier
+#endif
 
 #include "utils/FileIO.h"
 #include "utils/VkCheck.h"
@@ -660,7 +663,7 @@ int main() {
         VmaBuffer touchedTilesBuffer(
             vulkanDevice.getAllocator(),
             touchedTilesBufferSize,
-            vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc,
+            vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst,
             VMA_MEMORY_USAGE_GPU_ONLY
         );
         std::cout << "[System] Touched tiles buffer created (" << touchedTilesBufferSize << " bytes)." << std::endl;
@@ -936,7 +939,8 @@ int main() {
             MathUtils::buildViewProjection(mappedCameraData->viewProj, 0.0f, 0.0f, 5.0f,
                 fwdX, fwdY, fwdZ, WIDTH, HEIGHT);
             cameraBuffer.flush();
-
+            
+            /*
             // Acquire swapchain image (semaphore signals when available)
             auto acqResult = vulkanDevice.getDevice().acquireNextImageKHR(
                 *swapchain, UINT64_MAX, *imageAvailableSemaphores[currentFrame], nullptr);
@@ -944,6 +948,19 @@ int main() {
                 VK_CHECK(acqResult.result);
             }
             uint32_t imageIndex = acqResult.value;
+            */
+            uint32_t imageIndex;
+            try {
+                auto acqResult = vulkanDevice.getDevice().acquireNextImageKHR(
+                    *swapchain, UINT64_MAX, *imageAvailableSemaphores[currentFrame], nullptr);
+                if (acqResult.result != vk::Result::eSuccess && acqResult.result != vk::Result::eSuboptimalKHR) {
+                    throw std::runtime_error("Acquire image failed");
+                }
+                imageIndex = acqResult.value;
+            } catch (const vk::OutOfDateKHRError& e) {
+                std::cout << "[System] Warning: Window resized/Swapchain out of date. Exiting loop safely." << std::endl;
+                break; 
+            }
 
             // Extract the command scroll specific to the current frame
             auto& commandBuffer = commandBuffers[currentFrame];
@@ -1153,7 +1170,14 @@ int main() {
                 &imageIndex,
                 nullptr
             );
-            (void)vulkanDevice.getComputeQueue().presentKHR(presentInfo);
+            // (void)vulkanDevice.getComputeQueue().presentKHR(presentInfo);
+
+            try {
+                (void)vulkanDevice.getComputeQueue().presentKHR(presentInfo);
+            } catch (const vk::OutOfDateKHRError& e) {
+                std::cout << "[System] Warning: Swapchain out of date on Present. Exiting loop safely." << std::endl;
+                break; 
+            }
 
             currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
         }
