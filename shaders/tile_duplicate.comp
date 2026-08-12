@@ -1,0 +1,71 @@
+#version 460
+layout(local_size_x = 256) in;
+
+struct TileSortKeyPair {
+    uint64_t key;
+    uint index;
+};
+
+struct Gaussian2D {
+    vec2 pos2D;
+    float depth;
+    float opacity;
+    vec3 conic;
+    float pad1;
+    vec3 color;
+    uint bounds[4];
+    float pad2;
+};
+
+layout(std430, binding = 3) readonly buffer Gaussian2DBuffer {
+    Gaussian2D gaussians2D[];
+};
+
+layout(std430, binding = 9) readonly buffer TilePrefixSumBuffer {
+    uint tilePrefixSum[];
+};
+
+layout(std430, binding = 10) buffer TileSortKeyBuffer {
+    TileSortKeyPair tileSortKeys[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint count;
+    uint numTilesX;
+    uint numTilesY;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+
+    if (idx >= pc.count) return;
+
+    Gaussian2D g = gaussians2D[idx];
+
+    uint min_tx = g.bounds[0];
+    uint min_ty = g.bounds[1];
+    uint max_tx = g.bounds[2];
+    uint max_ty = g.bounds[3];
+
+    // Recompute depth key from linear depth (IEEE 754 float-to-sortable-uint)
+    uint depthKey = floatBitsToUint(g.depth);
+    depthKey = (depthKey & 0x80000000u) == 0u ? (~depthKey) : (depthKey ^ 0x80000000u);
+
+    // Get base write offset from prefix sum (read-only after tile_scan + barrier)
+    // uint writeOffset = tilePrefixSum[idx];
+
+    // Nested loop: spawn a copy for each touched tile
+    for (uint y = min_ty; y < max_ty; y++) {
+        for (uint x = min_tx; x < max_tx; x++) {
+            uint tileID = y * pc.numTilesX + x;
+            uint64_t key64 = (uint64_t(tileID) << 32u) | uint64_t(depthKey);
+
+            uint writeOffset = atomicAdd(tilePrefixSum[0], 1u);
+
+            tileSortKeys[writeOffset].key = key64;
+            tileSortKeys[writeOffset].index = idx;
+
+            writeOffset++;
+        }
+    }
+}

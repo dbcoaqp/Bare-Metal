@@ -36,6 +36,21 @@ set(PREPROCESS_SHADER_BIN "${CMAKE_SOURCE_DIR}/shaders/preprocess.spv")
 set(RASTERIZE_SHADER_SRC "${CMAKE_SOURCE_DIR}/shaders/rasterize.comp")
 set(RASTERIZE_SHADER_BIN "${CMAKE_SOURCE_DIR}/shaders/rasterize.spv")
 
+set(TILE_SCAN_SHADER_SRC "${CMAKE_SOURCE_DIR}/shaders/tile_scan.comp")
+set(TILE_SCAN_SHADER_BIN "${CMAKE_SOURCE_DIR}/shaders/tile_scan.spv")
+
+set(TILE_DUPLICATE_SHADER_SRC "${CMAKE_SOURCE_DIR}/shaders/tile_duplicate.comp")
+set(TILE_DUPLICATE_SHADER_BIN "${CMAKE_SOURCE_DIR}/shaders/tile_duplicate.spv")
+
+set(TILE_RADIX_HISTOGRAM_SHADER_SRC "${CMAKE_SOURCE_DIR}/shaders/tile_radix_histogram.comp")
+set(TILE_RADIX_HISTOGRAM_SHADER_BIN "${CMAKE_SOURCE_DIR}/shaders/tile_radix_histogram.spv")
+
+set(TILE_RADIX_SCAN_SHADER_SRC "${CMAKE_SOURCE_DIR}/shaders/tile_radix_scan.comp")
+set(TILE_RADIX_SCAN_SHADER_BIN "${CMAKE_SOURCE_DIR}/shaders/tile_radix_scan.spv")
+
+set(TILE_RADIX_SCATTER_SHADER_SRC "${CMAKE_SOURCE_DIR}/shaders/tile_radix_scatter.comp")
+set(TILE_RADIX_SCATTER_SHADER_BIN "${CMAKE_SOURCE_DIR}/shaders/tile_radix_scatter.spv")
+
 add_custom_command(
     OUTPUT ${SHADER_BIN}
     COMMAND ${GLSLC} ${SHADER_SRC} -o ${SHADER_BIN}
@@ -78,13 +93,53 @@ add_custom_command(
     COMMENT "Compiling compute shader: rasterize.comp -> rasterize.spv"
 )
 
+add_custom_command(
+    OUTPUT ${TILE_SCAN_SHADER_BIN}
+    COMMAND ${GLSLC} ${TILE_SCAN_SHADER_SRC} -o ${TILE_SCAN_SHADER_BIN}
+    DEPENDS ${TILE_SCAN_SHADER_SRC}
+    COMMENT "Compiling compute shader: tile_scan.comp -> tile_scan.spv"
+)
+
+add_custom_command(
+    OUTPUT ${TILE_DUPLICATE_SHADER_BIN}
+    COMMAND ${GLSLC} ${TILE_DUPLICATE_SHADER_SRC} -o ${TILE_DUPLICATE_SHADER_BIN}
+    DEPENDS ${TILE_DUPLICATE_SHADER_SRC}
+    COMMENT "Compiling compute shader: tile_duplicate.comp -> tile_duplicate.spv"
+)
+
+add_custom_command(
+    OUTPUT ${TILE_RADIX_HISTOGRAM_SHADER_BIN}
+    COMMAND ${GLSLC} ${TILE_RADIX_HISTOGRAM_SHADER_SRC} -o ${TILE_RADIX_HISTOGRAM_SHADER_BIN}
+    DEPENDS ${TILE_RADIX_HISTOGRAM_SHADER_SRC}
+    COMMENT "Compiling compute shader: tile_radix_histogram.comp -> tile_radix_histogram.spv"
+)
+
+add_custom_command(
+    OUTPUT ${TILE_RADIX_SCAN_SHADER_BIN}
+    COMMAND ${GLSLC} ${TILE_RADIX_SCAN_SHADER_SRC} -o ${TILE_RADIX_SCAN_SHADER_BIN}
+    DEPENDS ${TILE_RADIX_SCAN_SHADER_SRC}
+    COMMENT "Compiling compute shader: tile_radix_scan.comp -> tile_radix_scan.spv"
+)
+
+add_custom_command(
+    OUTPUT ${TILE_RADIX_SCATTER_SHADER_BIN}
+    COMMAND ${GLSLC} ${TILE_RADIX_SCATTER_SHADER_SRC} -o ${TILE_RADIX_SCATTER_SHADER_BIN}
+    DEPENDS ${TILE_RADIX_SCATTER_SHADER_SRC}
+    COMMENT "Compiling compute shader: tile_radix_scatter.comp -> tile_radix_scatter.spv"
+)
+
 add_custom_target(CompileShaders ALL DEPENDS 
     ${SHADER_BIN} 
     ${RADIX_HISTOGRAM_SHADER_BIN} 
     ${RADIX_SCAN_SHADER_BIN} 
     ${RADIX_SCATTER_SHADER_BIN} 
     ${PREPROCESS_SHADER_BIN} 
-    ${RASTERIZE_SHADER_BIN})
+    ${RASTERIZE_SHADER_BIN}
+    ${TILE_SCAN_SHADER_BIN}
+    ${TILE_DUPLICATE_SHADER_BIN}
+    ${TILE_RADIX_HISTOGRAM_SHADER_BIN}
+    ${TILE_RADIX_SCAN_SHADER_BIN}
+    ${TILE_RADIX_SCATTER_SHADER_BIN})
 
 include_directories(${Vulkan_INCLUDE_DIRS})
 include_directories(${CMAKE_SOURCE_DIR})

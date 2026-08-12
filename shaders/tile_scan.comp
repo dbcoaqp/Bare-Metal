@@ -1,0 +1,56 @@
+#version 460
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 8) readonly buffer TouchedTilesBuffer {
+    uint touchedTiles[];
+};
+
+layout(std430, binding = 9) buffer TilePrefixSumBuffer {
+    uint tilePrefixSum[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint count;
+    uint _pad1;
+    uint _pad2;
+} pc;
+
+shared uint sharedData[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint gid = gl_GlobalInvocationID.x;
+
+    // Phase 1: Load value (or zero if out of bounds)
+    uint val = 0u;
+    if (gid < pc.count) {
+        val = touchedTiles[gid];
+    }
+
+    sharedData[tid] = val;
+    barrier();
+
+    // Phase 2: Hillis-Steele inclusive prefix sum within this workgroup
+    for (uint stride = 1u; stride < 256u; stride <<= 1u) {
+        uint prev = 0u;
+        if (tid >= stride) {
+            prev = sharedData[tid - stride];
+        }
+        barrier();
+        sharedData[tid] += prev;
+        barrier();
+    }
+
+    // Phase 3: Write exclusive prefix sum result
+    // Exclusive = inclusive - own value
+    if (gid < pc.count) {
+        tilePrefixSum[gid] = sharedData[tid] - val;
+    }
+
+    // Phase 4: The very last valid element also needs the total sum written
+    // totalTileKeys = prefix_sum[count-1] + touchedTiles[count-1] = inclusive of last
+    // We store this at index [count] so we can Reverse DMA read it
+    if (gid == pc.count - 1u) {
+        tilePrefixSum[pc.count] = sharedData[tid];
+    }
+}

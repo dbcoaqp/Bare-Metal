@@ -503,6 +503,16 @@ int main() {
 
         uint32_t histogramGroupCount = (paddedCount + 255) / 256;
 
+        // ============================================================
+        // Phase 15: Tile grid parameters
+        // ============================================================
+        const uint32_t TILE_SIZE = 16;
+        uint32_t numTilesX = (WIDTH + TILE_SIZE - 1) / TILE_SIZE;
+        uint32_t numTilesY = (HEIGHT + TILE_SIZE - 1) / TILE_SIZE;
+        std::cout << "[System] Tile grid: " << numTilesX << " x " << numTilesY
+                  << " (" << numTilesX * numTilesY << " tiles total, tile size = "
+                  << TILE_SIZE << "px)." << std::endl;
+
         // 3. Staging buffer and DMA transfer
         VmaBuffer stagingBuffer(
             vulkanDevice.getAllocator(),
@@ -670,6 +680,68 @@ int main() {
         );
         std::cout << "[System] Touched tiles buffer created (" << touchedTilesBufferSize << " bytes)." << std::endl;
 
+        // ============================================================
+        // Phase 15: Tile prefix sum buffer
+        // (paddedCount + 1) elements: [0..paddedCount-1] = exclusive prefix sum,
+        // [paddedCount] = totalTileKeys
+        // ============================================================
+        vk::DeviceSize tilePrefixSumBufferSize = static_cast<vk::DeviceSize>(paddedCount + 1) * sizeof(uint32_t);
+        VmaBuffer tilePrefixSumBuffer(
+            vulkanDevice.getAllocator(),
+            tilePrefixSumBufferSize,
+            vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc,
+            VMA_MEMORY_USAGE_GPU_ONLY
+        );
+        std::cout << "[System] Tile prefix sum buffer created (" << tilePrefixSumBufferSize << " bytes)." << std::endl;
+
+        // ============================================================
+        // Phase 15: Tile sort key buffers (allocated with initial guess,
+        // will be dynamically re-allocated after tile_scan readback)
+        // Initial allocation: 8x paddedCount as a safe upper bound
+        // ============================================================
+        uint32_t tileSortKeyBufferElementCount = paddedCount * 8;  // Conservative initial guess
+        vk::DeviceSize tileSortKeyBufferSize = static_cast<vk::DeviceSize>(tileSortKeyBufferElementCount) * sizeof(TileSortKeyPair);
+
+        auto tileSortKeyBuffer = std::make_unique<VmaBuffer>(
+            vulkanDevice.getAllocator(),
+            tileSortKeyBufferSize,
+            vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eTransferSrc,
+            VMA_MEMORY_USAGE_GPU_ONLY
+        );
+        std::cout << "[System] Tile sort key buffer allocated (" << tileSortKeyBufferSize << " bytes, "
+                  << tileSortKeyBufferElementCount << " elements)." << std::endl;
+
+        auto tileSortKeyBufferAlt = std::make_unique<VmaBuffer>(
+            vulkanDevice.getAllocator(),
+            tileSortKeyBufferSize,
+            vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eTransferSrc,
+            VMA_MEMORY_USAGE_GPU_ONLY
+        );
+        std::cout << "[System] Tile sort key buffer alt allocated (" << tileSortKeyBufferSize << " bytes, ping-pong)." << std::endl;
+
+        // ============================================================
+        // Phase 15: Tile histogram & offset buffers for 64-bit radix sort
+        // ============================================================
+        uint32_t tileHistGroupCount = (tileSortKeyBufferElementCount + 255) / 256;
+        vk::DeviceSize tileHistogramBufferSize = static_cast<vk::DeviceSize>(tileHistGroupCount) * 256 * sizeof(uint32_t);
+
+        VmaBuffer tileHistogramBuffer(
+            vulkanDevice.getAllocator(),
+            tileHistogramBufferSize,
+            vk::BufferUsageFlagBits::eStorageBuffer,
+            VMA_MEMORY_USAGE_GPU_ONLY
+        );
+        std::cout << "[System] Tile radix histogram buffer created (" << tileHistogramBufferSize
+                  << " bytes, " << tileHistGroupCount << " workgroups x 256 buckets)." << std::endl;
+
+        VmaBuffer tileGlobalOffsetBuffer(
+            vulkanDevice.getAllocator(),
+            globalOffsetBufferSize,  // 256 uint32_t
+            vk::BufferUsageFlagBits::eStorageBuffer,
+            VMA_MEMORY_USAGE_GPU_ONLY
+        );
+        std::cout << "[System] Tile radix global offset buffer created (" << globalOffsetBufferSize << " bytes)." << std::endl;
+
         // 8. Shader module
         vk::ShaderModuleCreateInfo shaderModuleCreateInfo(
             vk::ShaderModuleCreateFlags(),
@@ -678,17 +750,36 @@ int main() {
         );
         auto shaderModule = vulkanDevice.getDevice().createShaderModuleUnique(shaderModuleCreateInfo);
 
-        // 9. Descriptor set layout (9 bindings: original 7 + radix sort 1 + touched tiles)
+        // 9. Descriptor set layout (14 bindings)
+        // 0:  GaussianBuffer (SSBO)
+        // 1:  SortKeyBuffer (SSBO, src for 32-bit radix)
+        // 2:  CameraUBO (UBO)
+        // 3:  Gaussian2DBuffer (SSBO)
+        // 4:  ImageBuffer (SSBO)
+        // 5:  SortKeyBufferAlt (SSBO, dst for 32-bit radix)
+        // 6:  HistogramBuffer (SSBO, 32-bit radix)
+        // 7:  GlobalOffsetBuffer (SSBO, 32-bit radix)
+        // 8:  TouchedTilesBuffer (SSBO)
+        // 9:  TilePrefixSumBuffer (SSBO)
+        // 10: TileSortKeyBuffer (SSBO, src for 64-bit tile radix)
+        // 11: TileSortKeyBufferAlt (SSBO, dst for 64-bit tile radix)
+        // 12: TileHistogramBuffer (SSBO, 64-bit tile radix)
+        // 13: TileGlobalOffsetBuffer (SSBO, 64-bit tile radix)
         std::vector<vk::DescriptorSetLayoutBinding> layoutBindings = {
-            vk::DescriptorSetLayoutBinding(0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute), // GaussianBuffer
-            vk::DescriptorSetLayoutBinding(1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute), // SortKeyBuffer (src)
-            vk::DescriptorSetLayoutBinding(2, vk::DescriptorType::eUniformBuffer, 1, vk::ShaderStageFlagBits::eCompute), // CameraUBO
-            vk::DescriptorSetLayoutBinding(3, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute), // Gaussian2DBuffer
-            vk::DescriptorSetLayoutBinding(4, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute), // ImageBuffer
-            vk::DescriptorSetLayoutBinding(5, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute), // SortKeyBufferAlt (dst)
-            vk::DescriptorSetLayoutBinding(6, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute), // HistogramBuffer
-            vk::DescriptorSetLayoutBinding(7, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute), // GlobalOffsetBuffer
-            vk::DescriptorSetLayoutBinding(8, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute)  // TouchedTilesBuffer
+            vk::DescriptorSetLayoutBinding(0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute),
+            vk::DescriptorSetLayoutBinding(1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute),
+            vk::DescriptorSetLayoutBinding(2, vk::DescriptorType::eUniformBuffer, 1, vk::ShaderStageFlagBits::eCompute),
+            vk::DescriptorSetLayoutBinding(3, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute),
+            vk::DescriptorSetLayoutBinding(4, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute),
+            vk::DescriptorSetLayoutBinding(5, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute),
+            vk::DescriptorSetLayoutBinding(6, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute),
+            vk::DescriptorSetLayoutBinding(7, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute),
+            vk::DescriptorSetLayoutBinding(8, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute),
+            vk::DescriptorSetLayoutBinding(9, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute),
+            vk::DescriptorSetLayoutBinding(10, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute),
+            vk::DescriptorSetLayoutBinding(11, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute),
+            vk::DescriptorSetLayoutBinding(12, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute),
+            vk::DescriptorSetLayoutBinding(13, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute),
         };
 
         vk::DescriptorSetLayoutCreateInfo layoutCreateInfo(
@@ -699,15 +790,15 @@ int main() {
 
         auto descriptorSetLayout = vulkanDevice.getDevice().createDescriptorSetLayoutUnique(layoutCreateInfo);
 
-        // 10. Descriptor pool (2 descriptor sets, 9 bindings each)
+        // 10. Descriptor pool (4 descriptor sets: mainDS + swapDS + tileMainDS + tileSwapDS, 14 bindings each)
         std::vector<vk::DescriptorPoolSize> poolSizes = {
-            vk::DescriptorPoolSize(vk::DescriptorType::eStorageBuffer, 16),  // 8 storage buffers x 2 sets
-            vk::DescriptorPoolSize(vk::DescriptorType::eUniformBuffer, 2)    // 1 uniform buffer x 2 sets
+            vk::DescriptorPoolSize(vk::DescriptorType::eStorageBuffer, 56),  // 14 storage buffers x 4 sets
+            vk::DescriptorPoolSize(vk::DescriptorType::eUniformBuffer, 4)    // 1 uniform buffer x 4 sets
         };
 
         vk::DescriptorPoolCreateInfo poolCreateInfo(
             vk::DescriptorPoolCreateFlags(),
-            2,  // maxSets: mainDS + swapDS
+            4,  // maxSets: mainDS + swapDS + tileMainDS + tileSwapDS
             static_cast<uint32_t>(poolSizes.size()),
             poolSizes.data()
         );
@@ -751,7 +842,7 @@ int main() {
         }
         auto computePipeline = std::move(computePipelineResult.value);
 
-        // 12b. radix_histogram pipeline
+        // 12b. radix_histogram pipeline (32-bit, reads SortKeyPair from binding 1)
         std::string radixHistogramShaderPath = std::string(SHADER_DIR) + "/radix_histogram.spv";
         auto radixHistogramShaderCode = FileIO::readFile(radixHistogramShaderPath);
 
@@ -770,7 +861,7 @@ int main() {
         auto radixHistogramPipeline = std::move(radixHistogramPipelineResult.value);
         std::cout << "[System] Radix histogram pipeline created." << std::endl;
 
-        // 12c. radix_scan pipeline
+        // 12c. radix_scan pipeline (32-bit, reads histogram from binding 6, writes offsets to binding 7)
         std::string radixScanShaderPath = std::string(SHADER_DIR) + "/radix_scan.spv";
         auto radixScanShaderCode = FileIO::readFile(radixScanShaderPath);
 
@@ -789,7 +880,7 @@ int main() {
         auto radixScanPipeline = std::move(radixScanPipelineResult.value);
         std::cout << "[System] Radix scan pipeline created." << std::endl;
 
-        // 12d. radix_scatter pipeline
+        // 12d. radix_scatter pipeline (32-bit, reads SortKeyPair from binding 1, writes to binding 5)
         std::string radixScatterShaderPath = std::string(SHADER_DIR) + "/radix_scatter.spv";
         auto radixScatterShaderCode = FileIO::readFile(radixScatterShaderPath);
 
@@ -846,48 +937,209 @@ int main() {
         auto rasterizePipeline = std::move(rasterizePipelineResult.value);
         std::cout << "[System] Rasterize pipeline created." << std::endl;
 
-        // 13. Descriptor sets (2 sets: mainDS + swapDS for ping-pong radix sort)
+        // ============================================================
+        // Phase 15: tile_scan pipeline
+        // ============================================================
+        std::string tileScanShaderPath = std::string(SHADER_DIR) + "/tile_scan.spv";
+        auto tileScanShaderCode = FileIO::readFile(tileScanShaderPath);
+
+        vk::ShaderModuleCreateInfo tileScanSMCI(vk::ShaderModuleCreateFlags(), tileScanShaderCode.size(),
+            reinterpret_cast<const uint32_t*>(tileScanShaderCode.data()));
+        auto tileScanShaderModule = vulkanDevice.getDevice().createShaderModuleUnique(tileScanSMCI);
+
+        vk::PipelineShaderStageCreateInfo tileScanStageCI(
+            vk::PipelineShaderStageCreateFlags(), vk::ShaderStageFlagBits::eCompute, *tileScanShaderModule, "main");
+        vk::ComputePipelineCreateInfo tileScanPipelineCI(vk::PipelineCreateFlags(), tileScanStageCI, *pipelineLayout);
+
+        auto tileScanPipelineResult = vulkanDevice.getDevice().createComputePipelineUnique(nullptr, tileScanPipelineCI);
+        if (tileScanPipelineResult.result != vk::Result::eSuccess) {
+            throw std::runtime_error("Fatal: Failed to create tile_scan compute pipeline.");
+        }
+        auto tileScanPipeline = std::move(tileScanPipelineResult.value);
+        std::cout << "[System] Tile scan pipeline created." << std::endl;
+
+        // ============================================================
+        // Phase 15: tile_duplicate pipeline
+        // ============================================================
+        std::string tileDuplicateShaderPath = std::string(SHADER_DIR) + "/tile_duplicate.spv";
+        auto tileDuplicateShaderCode = FileIO::readFile(tileDuplicateShaderPath);
+
+        vk::ShaderModuleCreateInfo tileDuplicateSMCI(vk::ShaderModuleCreateFlags(), tileDuplicateShaderCode.size(),
+            reinterpret_cast<const uint32_t*>(tileDuplicateShaderCode.data()));
+        auto tileDuplicateShaderModule = vulkanDevice.getDevice().createShaderModuleUnique(tileDuplicateSMCI);
+
+        vk::PipelineShaderStageCreateInfo tileDuplicateStageCI(
+            vk::PipelineShaderStageCreateFlags(), vk::ShaderStageFlagBits::eCompute, *tileDuplicateShaderModule, "main");
+        vk::ComputePipelineCreateInfo tileDuplicatePipelineCI(vk::PipelineCreateFlags(), tileDuplicateStageCI, *pipelineLayout);
+
+        auto tileDuplicatePipelineResult = vulkanDevice.getDevice().createComputePipelineUnique(nullptr, tileDuplicatePipelineCI);
+        if (tileDuplicatePipelineResult.result != vk::Result::eSuccess) {
+            throw std::runtime_error("Fatal: Failed to create tile_duplicate compute pipeline.");
+        }
+        auto tileDuplicatePipeline = std::move(tileDuplicatePipelineResult.value);
+        std::cout << "[System] Tile duplicate pipeline created." << std::endl;
+
+        // ============================================================
+        // Phase 15: tile_radix_histogram pipeline (64-bit, reads TileSortKeyPair from binding 10)
+        // ============================================================
+        std::string tileRadixHistogramShaderPath = std::string(SHADER_DIR) + "/tile_radix_histogram.spv";
+        auto tileRadixHistogramShaderCode = FileIO::readFile(tileRadixHistogramShaderPath);
+
+        vk::ShaderModuleCreateInfo tileRadixHistogramSMCI(vk::ShaderModuleCreateFlags(), tileRadixHistogramShaderCode.size(),
+            reinterpret_cast<const uint32_t*>(tileRadixHistogramShaderCode.data()));
+        auto tileRadixHistogramShaderModule = vulkanDevice.getDevice().createShaderModuleUnique(tileRadixHistogramSMCI);
+
+        vk::PipelineShaderStageCreateInfo tileRadixHistogramStageCI(
+            vk::PipelineShaderStageCreateFlags(), vk::ShaderStageFlagBits::eCompute, *tileRadixHistogramShaderModule, "main");
+        vk::ComputePipelineCreateInfo tileRadixHistogramPipelineCI(vk::PipelineCreateFlags(), tileRadixHistogramStageCI, *pipelineLayout);
+
+        auto tileRadixHistogramPipelineResult = vulkanDevice.getDevice().createComputePipelineUnique(nullptr, tileRadixHistogramPipelineCI);
+        if (tileRadixHistogramPipelineResult.result != vk::Result::eSuccess) {
+            throw std::runtime_error("Fatal: Failed to create tile_radix_histogram compute pipeline.");
+        }
+        auto tileRadixHistogramPipeline = std::move(tileRadixHistogramPipelineResult.value);
+        std::cout << "[System] Tile radix histogram pipeline created." << std::endl;
+
+        // ============================================================
+        // Phase 15: tile_radix_scan pipeline (64-bit, reads histogram from binding 12)
+        // ============================================================
+        std::string tileRadixScanShaderPath = std::string(SHADER_DIR) + "/tile_radix_scan.spv";
+        auto tileRadixScanShaderCode = FileIO::readFile(tileRadixScanShaderPath);
+
+        vk::ShaderModuleCreateInfo tileRadixScanSMCI(vk::ShaderModuleCreateFlags(), tileRadixScanShaderCode.size(),
+            reinterpret_cast<const uint32_t*>(tileRadixScanShaderCode.data()));
+        auto tileRadixScanShaderModule = vulkanDevice.getDevice().createShaderModuleUnique(tileRadixScanSMCI);
+
+        vk::PipelineShaderStageCreateInfo tileRadixScanStageCI(
+            vk::PipelineShaderStageCreateFlags(), vk::ShaderStageFlagBits::eCompute, *tileRadixScanShaderModule, "main");
+        vk::ComputePipelineCreateInfo tileRadixScanPipelineCI(vk::PipelineCreateFlags(), tileRadixScanStageCI, *pipelineLayout);
+
+        auto tileRadixScanPipelineResult = vulkanDevice.getDevice().createComputePipelineUnique(nullptr, tileRadixScanPipelineCI);
+        if (tileRadixScanPipelineResult.result != vk::Result::eSuccess) {
+            throw std::runtime_error("Fatal: Failed to create tile_radix_scan compute pipeline.");
+        }
+        auto tileRadixScanPipeline = std::move(tileRadixScanPipelineResult.value);
+        std::cout << "[System] Tile radix scan pipeline created." << std::endl;
+
+        // ============================================================
+        // Phase 15: tile_radix_scatter pipeline (64-bit, reads TileSortKeyPair from binding 10, writes to binding 11)
+        // ============================================================
+        std::string tileRadixScatterShaderPath = std::string(SHADER_DIR) + "/tile_radix_scatter.spv";
+        auto tileRadixScatterShaderCode = FileIO::readFile(tileRadixScatterShaderPath);
+
+        vk::ShaderModuleCreateInfo tileRadixScatterSMCI(vk::ShaderModuleCreateFlags(), tileRadixScatterShaderCode.size(),
+            reinterpret_cast<const uint32_t*>(tileRadixScatterShaderCode.data()));
+        auto tileRadixScatterShaderModule = vulkanDevice.getDevice().createShaderModuleUnique(tileRadixScatterSMCI);
+
+        vk::PipelineShaderStageCreateInfo tileRadixScatterStageCI(
+            vk::PipelineShaderStageCreateFlags(), vk::ShaderStageFlagBits::eCompute, *tileRadixScatterShaderModule, "main");
+        vk::ComputePipelineCreateInfo tileRadixScatterPipelineCI(vk::PipelineCreateFlags(), tileRadixScatterStageCI, *pipelineLayout);
+
+        auto tileRadixScatterPipelineResult = vulkanDevice.getDevice().createComputePipelineUnique(nullptr, tileRadixScatterPipelineCI);
+        if (tileRadixScatterPipelineResult.result != vk::Result::eSuccess) {
+            throw std::runtime_error("Fatal: Failed to create tile_radix_scatter compute pipeline.");
+        }
+        auto tileRadixScatterPipeline = std::move(tileRadixScatterPipelineResult.value);
+        std::cout << "[System] Tile radix scatter pipeline created." << std::endl;
+
+        // 13. Descriptor sets (4 sets: mainDS + swapDS for 32-bit, tileMainDS + tileSwapDS for 64-bit)
         std::vector<vk::DescriptorSetLayout> setLayouts = {*descriptorSetLayout, *descriptorSetLayout};
         vk::DescriptorSetAllocateInfo descriptorSetAllocateInfo(*descriptorPool, static_cast<uint32_t>(setLayouts.size()), setLayouts.data());
         auto descriptorSets = vulkanDevice.getDevice().allocateDescriptorSets(descriptorSetAllocateInfo);
         auto mainDS = descriptorSets[0];
         auto swapDS = descriptorSets[1];
 
-        vk::DescriptorBufferInfo gaussianBufferInfo(gaussianBuffer.getBuffer(), 0, gaussianBufferSize);
-        vk::DescriptorBufferInfo sortKeyBufferInfo(sortKeyBuffer.getBuffer(), 0, sortKeyBufferSize);
-        vk::DescriptorBufferInfo cameraBufferInfo(cameraBuffer.getBuffer(), 0, sizeof(CameraUniform));
-        vk::DescriptorBufferInfo gaussian2DBufferInfo(gaussian2DBuffer.getBuffer(), 0, gaussian2DBufferSize);
-        vk::DescriptorBufferInfo imageBufferInfo(imageBuffer.getBuffer(), 0, imageBufferSize);
-        vk::DescriptorBufferInfo sortKeyBufferAltInfo(sortKeyBufferAlt.getBuffer(), 0, sortKeyBufferSize);
-        vk::DescriptorBufferInfo histogramBufferInfo(histogramBuffer.getBuffer(), 0, histogramBufferSize);
-        vk::DescriptorBufferInfo globalOffsetBufferInfo(globalOffsetBuffer.getBuffer(), 0, globalOffsetBufferSize);
-        vk::DescriptorBufferInfo touchedTilesBufferInfo(touchedTilesBuffer.getBuffer(), 0, touchedTilesBufferSize);
+        std::vector<vk::DescriptorSetLayout> tileSetLayouts = {*descriptorSetLayout, *descriptorSetLayout};
+        vk::DescriptorSetAllocateInfo tileDSAllocateInfo(*descriptorPool, static_cast<uint32_t>(tileSetLayouts.size()), tileSetLayouts.data());
+        auto tileDescriptorSets = vulkanDevice.getDevice().allocateDescriptorSets(tileDSAllocateInfo);
+        auto tileMainDS = tileDescriptorSets[0];
+        auto tileSwapDS = tileDescriptorSets[1];
 
-        std::vector<vk::WriteDescriptorSet> allWrites = {
-            // mainDS: binding 1 = sortKeyBuffer (src), binding 5 = sortKeyBufferAlt (dst)
-            vk::WriteDescriptorSet(mainDS, 0, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &gaussianBufferInfo, nullptr),
-            vk::WriteDescriptorSet(mainDS, 1, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &sortKeyBufferInfo, nullptr),
-            vk::WriteDescriptorSet(mainDS, 2, 0, 1, vk::DescriptorType::eUniformBuffer, nullptr, &cameraBufferInfo, nullptr),
-            vk::WriteDescriptorSet(mainDS, 3, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &gaussian2DBufferInfo, nullptr),
-            vk::WriteDescriptorSet(mainDS, 4, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &imageBufferInfo, nullptr),
-            vk::WriteDescriptorSet(mainDS, 5, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &sortKeyBufferAltInfo, nullptr),
-            vk::WriteDescriptorSet(mainDS, 6, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &histogramBufferInfo, nullptr),
-            vk::WriteDescriptorSet(mainDS, 7, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &globalOffsetBufferInfo, nullptr),
-            vk::WriteDescriptorSet(mainDS, 8, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &touchedTilesBufferInfo, nullptr),
-            // swapDS: binding 1 = sortKeyBufferAlt (src), binding 5 = sortKeyBuffer (dst) — SWAPPED
-            vk::WriteDescriptorSet(swapDS, 0, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &gaussianBufferInfo, nullptr),
-            vk::WriteDescriptorSet(swapDS, 1, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &sortKeyBufferAltInfo, nullptr),
-            vk::WriteDescriptorSet(swapDS, 2, 0, 1, vk::DescriptorType::eUniformBuffer, nullptr, &cameraBufferInfo, nullptr),
-            vk::WriteDescriptorSet(swapDS, 3, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &gaussian2DBufferInfo, nullptr),
-            vk::WriteDescriptorSet(swapDS, 4, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &imageBufferInfo, nullptr),
-            vk::WriteDescriptorSet(swapDS, 5, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &sortKeyBufferInfo, nullptr),
-            vk::WriteDescriptorSet(swapDS, 6, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &histogramBufferInfo, nullptr),
-            vk::WriteDescriptorSet(swapDS, 7, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &globalOffsetBufferInfo, nullptr),
-            vk::WriteDescriptorSet(swapDS, 8, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &touchedTilesBufferInfo, nullptr),
+        // Helper lambda to update all descriptor sets
+        auto updateAllDescriptorSets = [&]() {
+            vk::DescriptorBufferInfo gaussianBufferInfo(gaussianBuffer.getBuffer(), 0, gaussianBufferSize);
+            vk::DescriptorBufferInfo sortKeyBufferInfo(sortKeyBuffer.getBuffer(), 0, sortKeyBufferSize);
+            vk::DescriptorBufferInfo cameraBufferInfo(cameraBuffer.getBuffer(), 0, sizeof(CameraUniform));
+            vk::DescriptorBufferInfo gaussian2DBufferInfo(gaussian2DBuffer.getBuffer(), 0, gaussian2DBufferSize);
+            vk::DescriptorBufferInfo imageBufferInfo(imageBuffer.getBuffer(), 0, imageBufferSize);
+            vk::DescriptorBufferInfo sortKeyBufferAltInfo(sortKeyBufferAlt.getBuffer(), 0, sortKeyBufferSize);
+            vk::DescriptorBufferInfo histogramBufferInfo(histogramBuffer.getBuffer(), 0, histogramBufferSize);
+            vk::DescriptorBufferInfo globalOffsetBufferInfo(globalOffsetBuffer.getBuffer(), 0, globalOffsetBufferSize);
+            vk::DescriptorBufferInfo touchedTilesBufferInfo(touchedTilesBuffer.getBuffer(), 0, touchedTilesBufferSize);
+            vk::DescriptorBufferInfo tilePrefixSumBufferInfo(tilePrefixSumBuffer.getBuffer(), 0, tilePrefixSumBufferSize);
+            vk::DescriptorBufferInfo tileSortKeyBufferInfo(tileSortKeyBuffer->getBuffer(), 0, tileSortKeyBufferSize);
+            vk::DescriptorBufferInfo tileSortKeyBufferAltInfo(tileSortKeyBufferAlt->getBuffer(), 0, tileSortKeyBufferSize);
+            vk::DescriptorBufferInfo tileHistogramBufferInfo(tileHistogramBuffer.getBuffer(), 0, tileHistogramBufferSize);
+            vk::DescriptorBufferInfo tileGlobalOffsetBufferInfo(tileGlobalOffsetBuffer.getBuffer(), 0, globalOffsetBufferSize);
+
+            std::vector<vk::WriteDescriptorSet> allWrites = {
+                // mainDS: 32-bit depth sort ping-pong (binding 1=src, binding 5=dst)
+                vk::WriteDescriptorSet(mainDS, 0, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &gaussianBufferInfo, nullptr),
+                vk::WriteDescriptorSet(mainDS, 1, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &sortKeyBufferInfo, nullptr),
+                vk::WriteDescriptorSet(mainDS, 2, 0, 1, vk::DescriptorType::eUniformBuffer, nullptr, &cameraBufferInfo, nullptr),
+                vk::WriteDescriptorSet(mainDS, 3, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &gaussian2DBufferInfo, nullptr),
+                vk::WriteDescriptorSet(mainDS, 4, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &imageBufferInfo, nullptr),
+                vk::WriteDescriptorSet(mainDS, 5, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &sortKeyBufferAltInfo, nullptr),
+                vk::WriteDescriptorSet(mainDS, 6, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &histogramBufferInfo, nullptr),
+                vk::WriteDescriptorSet(mainDS, 7, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &globalOffsetBufferInfo, nullptr),
+                vk::WriteDescriptorSet(mainDS, 8, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &touchedTilesBufferInfo, nullptr),
+                vk::WriteDescriptorSet(mainDS, 9, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tilePrefixSumBufferInfo, nullptr),
+                vk::WriteDescriptorSet(mainDS, 10, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tileSortKeyBufferInfo, nullptr),
+                vk::WriteDescriptorSet(mainDS, 11, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tileSortKeyBufferAltInfo, nullptr),
+                vk::WriteDescriptorSet(mainDS, 12, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tileHistogramBufferInfo, nullptr),
+                vk::WriteDescriptorSet(mainDS, 13, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tileGlobalOffsetBufferInfo, nullptr),
+                // swapDS: 32-bit depth sort ping-pong (binding 1=dst, binding 5=src — SWAPPED)
+                vk::WriteDescriptorSet(swapDS, 0, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &gaussianBufferInfo, nullptr),
+                vk::WriteDescriptorSet(swapDS, 1, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &sortKeyBufferAltInfo, nullptr),
+                vk::WriteDescriptorSet(swapDS, 2, 0, 1, vk::DescriptorType::eUniformBuffer, nullptr, &cameraBufferInfo, nullptr),
+                vk::WriteDescriptorSet(swapDS, 3, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &gaussian2DBufferInfo, nullptr),
+                vk::WriteDescriptorSet(swapDS, 4, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &imageBufferInfo, nullptr),
+                vk::WriteDescriptorSet(swapDS, 5, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &sortKeyBufferInfo, nullptr),
+                vk::WriteDescriptorSet(swapDS, 6, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &histogramBufferInfo, nullptr),
+                vk::WriteDescriptorSet(swapDS, 7, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &globalOffsetBufferInfo, nullptr),
+                vk::WriteDescriptorSet(swapDS, 8, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &touchedTilesBufferInfo, nullptr),
+                vk::WriteDescriptorSet(swapDS, 9, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tilePrefixSumBufferInfo, nullptr),
+                vk::WriteDescriptorSet(swapDS, 10, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tileSortKeyBufferInfo, nullptr),
+                vk::WriteDescriptorSet(swapDS, 11, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tileSortKeyBufferAltInfo, nullptr),
+                vk::WriteDescriptorSet(swapDS, 12, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tileHistogramBufferInfo, nullptr),
+                vk::WriteDescriptorSet(swapDS, 13, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tileGlobalOffsetBufferInfo, nullptr),
+                // tileMainDS: 64-bit tile radix ping-pong (binding 10=src, binding 11=dst)
+                vk::WriteDescriptorSet(tileMainDS, 0, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &gaussianBufferInfo, nullptr),
+                vk::WriteDescriptorSet(tileMainDS, 1, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &sortKeyBufferInfo, nullptr),
+                vk::WriteDescriptorSet(tileMainDS, 2, 0, 1, vk::DescriptorType::eUniformBuffer, nullptr, &cameraBufferInfo, nullptr),
+                vk::WriteDescriptorSet(tileMainDS, 3, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &gaussian2DBufferInfo, nullptr),
+                vk::WriteDescriptorSet(tileMainDS, 4, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &imageBufferInfo, nullptr),
+                vk::WriteDescriptorSet(tileMainDS, 5, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &sortKeyBufferAltInfo, nullptr),
+                vk::WriteDescriptorSet(tileMainDS, 6, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &histogramBufferInfo, nullptr),
+                vk::WriteDescriptorSet(tileMainDS, 7, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &globalOffsetBufferInfo, nullptr),
+                vk::WriteDescriptorSet(tileMainDS, 8, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &touchedTilesBufferInfo, nullptr),
+                vk::WriteDescriptorSet(tileMainDS, 9, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tilePrefixSumBufferInfo, nullptr),
+                vk::WriteDescriptorSet(tileMainDS, 10, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tileSortKeyBufferInfo, nullptr),
+                vk::WriteDescriptorSet(tileMainDS, 11, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tileSortKeyBufferAltInfo, nullptr),
+                vk::WriteDescriptorSet(tileMainDS, 12, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tileHistogramBufferInfo, nullptr),
+                vk::WriteDescriptorSet(tileMainDS, 13, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tileGlobalOffsetBufferInfo, nullptr),
+                // tileSwapDS: 64-bit tile radix ping-pong (binding 10=dst, binding 11=src — SWAPPED)
+                vk::WriteDescriptorSet(tileSwapDS, 0, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &gaussianBufferInfo, nullptr),
+                vk::WriteDescriptorSet(tileSwapDS, 1, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &sortKeyBufferInfo, nullptr),
+                vk::WriteDescriptorSet(tileSwapDS, 2, 0, 1, vk::DescriptorType::eUniformBuffer, nullptr, &cameraBufferInfo, nullptr),
+                vk::WriteDescriptorSet(tileSwapDS, 3, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &gaussian2DBufferInfo, nullptr),
+                vk::WriteDescriptorSet(tileSwapDS, 4, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &imageBufferInfo, nullptr),
+                vk::WriteDescriptorSet(tileSwapDS, 5, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &sortKeyBufferAltInfo, nullptr),
+                vk::WriteDescriptorSet(tileSwapDS, 6, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &histogramBufferInfo, nullptr),
+                vk::WriteDescriptorSet(tileSwapDS, 7, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &globalOffsetBufferInfo, nullptr),
+                vk::WriteDescriptorSet(tileSwapDS, 8, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &touchedTilesBufferInfo, nullptr),
+                vk::WriteDescriptorSet(tileSwapDS, 9, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tilePrefixSumBufferInfo, nullptr),
+                vk::WriteDescriptorSet(tileSwapDS, 10, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tileSortKeyBufferAltInfo, nullptr),
+                vk::WriteDescriptorSet(tileSwapDS, 11, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tileSortKeyBufferInfo, nullptr),
+                vk::WriteDescriptorSet(tileSwapDS, 12, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tileHistogramBufferInfo, nullptr),
+                vk::WriteDescriptorSet(tileSwapDS, 13, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tileGlobalOffsetBufferInfo, nullptr),
+            };
+
+            vulkanDevice.getDevice().updateDescriptorSets(
+                static_cast<uint32_t>(allWrites.size()), allWrites.data(), 0, nullptr);
         };
 
-        vulkanDevice.getDevice().updateDescriptorSets(
-            static_cast<uint32_t>(allWrites.size()), allWrites.data(), 0, nullptr);
+        updateAllDescriptorSets();
 
         // 14. Command buffer
         const uint32_t MAX_FRAMES_IN_FLIGHT = static_cast<uint32_t>(swapchainImages.size());
@@ -942,15 +1194,6 @@ int main() {
                 fwdX, fwdY, fwdZ, WIDTH, HEIGHT);
             cameraBuffer.flush();
             
-            /*
-            // Acquire swapchain image (semaphore signals when available)
-            auto acqResult = vulkanDevice.getDevice().acquireNextImageKHR(
-                *swapchain, UINT64_MAX, *imageAvailableSemaphores[currentFrame], nullptr);
-            if (acqResult.result != vk::Result::eSuccess && acqResult.result != vk::Result::eSuboptimalKHR) {
-                VK_CHECK(acqResult.result);
-            }
-            uint32_t imageIndex = acqResult.value;
-            */
             uint32_t imageIndex;
             try {
                 auto acqResult = vulkanDevice.getDevice().acquireNextImageKHR(
@@ -979,6 +1222,10 @@ int main() {
             commandBuffer->fillBuffer(sortKeyBuffer.getBuffer(), 0, VK_WHOLE_SIZE, ~0u);
             commandBuffer->fillBuffer(gaussian2DBuffer.getBuffer(), 0, VK_WHOLE_SIZE, 0);
             commandBuffer->fillBuffer(touchedTilesBuffer.getBuffer(), 0, VK_WHOLE_SIZE, 0);
+            commandBuffer->fillBuffer(tilePrefixSumBuffer.getBuffer(), 0, VK_WHOLE_SIZE, 0);
+            //commandBuffer->fillBuffer(tileSortKeyBuffer->getBuffer(), 0, VK_WHOLE_SIZE, 0);
+            commandBuffer->fillBuffer(tileSortKeyBuffer->getBuffer(), 0, VK_WHOLE_SIZE, ~0u);
+            commandBuffer->fillBuffer(tileSortKeyBufferAlt->getBuffer(), 0, VK_WHOLE_SIZE, ~0u);
 
             vk::MemoryBarrier fillBarrier(
                 vk::AccessFlagBits::eTransferWrite,
@@ -1004,23 +1251,18 @@ int main() {
 
             nvtxRangePop();
 
-            // ====== Stage B: Radix Sort O(N) ======
+            // ====== Stage B: 32-bit Radix Sort O(N) ======
             nvtxRangePushA("2. Radix Sort O(N)");
 
-            // ============================================================
-            // Radix Sort: 4 passes over 8-bit chunks (O(N) total)
-            // After 4 passes (even), sorted data resides in sortKeyBuffer.
-            // ============================================================
             for (uint32_t pass = 0; pass < 4; pass++) {
                 uint32_t shift = pass * 8;
                 bool isEvenPass = (pass % 2 == 0);
                 vk::DescriptorSet currentDS = isEvenPass ? mainDS : swapDS;
 
-                // Bind the correct descriptor set for this pass (ping-pong)
                 commandBuffer->bindDescriptorSets(
                     vk::PipelineBindPoint::eCompute, *pipelineLayout, 0, 1, &currentDS, 0, nullptr);
 
-                // --- Histogram Pass ---
+                // --- Histogram Pass (32-bit: reads SortKeyPair from binding 1) ---
                 commandBuffer->bindPipeline(vk::PipelineBindPoint::eCompute, *radixHistogramPipeline);
                 uint32_t histPC[3] = {shift, 0, 0};
                 commandBuffer->pushConstants<uint32_t>(
@@ -1034,7 +1276,7 @@ int main() {
                     vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eComputeShader,
                     vk::DependencyFlags(), 1, &histBarrier, 0, nullptr, 0, nullptr);
 
-                // --- Scan Pass (single workgroup) ---
+                // --- Scan Pass (32-bit: reads histogram from binding 6, writes to binding 7) ---
                 commandBuffer->bindPipeline(vk::PipelineBindPoint::eCompute, *radixScanPipeline);
                 uint32_t scanPC[3] = {histogramGroupCount, 0, 0};
                 commandBuffer->pushConstants<uint32_t>(
@@ -1048,7 +1290,7 @@ int main() {
                     vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eComputeShader,
                     vk::DependencyFlags(), 1, &scanBarrier, 0, nullptr, 0, nullptr);
 
-                // --- Scatter Pass ---
+                // --- Scatter Pass (32-bit: reads SortKeyPair from binding 1, writes to binding 5) ---
                 commandBuffer->bindPipeline(vk::PipelineBindPoint::eCompute, *radixScatterPipeline);
                 uint32_t scatterPC[3] = {shift, 0, 0};
                 commandBuffer->pushConstants<uint32_t>(
@@ -1084,9 +1326,113 @@ int main() {
             commandBuffer->dispatch(preprocessGroupCountX, 1, 1);
 
             nvtxRangePop();
+            /*
+            // ====== Stage D: Tile Scan (Exclusive Prefix Sum) ======
+            nvtxRangePushA("4. Tile Scan (Prefix Sum)");
 
-            // ====== Stage D: Compute Rasterization ======
-            nvtxRangePushA("4. Compute Rasterization");
+            vk::MemoryBarrier tileScanBarrier(
+                vk::AccessFlagBits::eShaderWrite,
+                vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite);
+            commandBuffer->pipelineBarrier(
+                vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eComputeShader,
+                vk::DependencyFlags(), 1, &tileScanBarrier, 0, nullptr, 0, nullptr);
+
+            commandBuffer->bindPipeline(vk::PipelineBindPoint::eCompute, *tileScanPipeline);
+            uint32_t tileScanPC[3] = {paddedCount, 0, 0};
+            commandBuffer->pushConstants<uint32_t>(
+                *pipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, tileScanPC);
+            uint32_t tileScanGroupCount = (paddedCount + 255) / 256;
+            commandBuffer->dispatch(tileScanGroupCount, 1, 1);
+
+            vk::MemoryBarrier tileScanWriteBarrier(
+                vk::AccessFlagBits::eShaderWrite,
+                vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite);
+            commandBuffer->pipelineBarrier(
+                vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eComputeShader,
+                vk::DependencyFlags(), 1, &tileScanWriteBarrier, 0, nullptr, 0, nullptr);
+
+            nvtxRangePop();
+            */
+            // ====== Stage E: Tile Duplicate (Space Explosion) ======
+            nvtxRangePushA("5. Tile Duplicate (Space Explosion)");
+
+            commandBuffer->bindPipeline(vk::PipelineBindPoint::eCompute, *tileDuplicatePipeline);
+            uint32_t tileDupPC[3] = {static_cast<uint32_t>(pointData.size()), numTilesX, numTilesY};
+            commandBuffer->pushConstants<uint32_t>(
+                *pipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, tileDupPC);
+            commandBuffer->dispatch(groupCountX, 1, 1);
+
+            vk::MemoryBarrier tileDupBarrier(
+                vk::AccessFlagBits::eShaderWrite,
+                vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite);
+            commandBuffer->pipelineBarrier(
+                vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eComputeShader,
+                vk::DependencyFlags(), 1, &tileDupBarrier, 0, nullptr, 0, nullptr);
+
+            nvtxRangePop();
+
+            // ====== Stage F: 64-bit Tile Radix Sort ======
+            nvtxRangePushA("6. 64-bit Tile Radix Sort");
+
+            // 8 passes for 64-bit key (low bytes first = depth, high bytes = tileID)
+            // Uses dedicated tile radix shaders reading TileSortKeyPair from binding 10/11
+            uint32_t tileHistGroupCountActual = (tileSortKeyBufferElementCount + 255) / 256;
+
+            for (uint32_t pass = 0; pass < 8; pass++) {
+                uint32_t shift = pass * 8;
+                bool isEvenPass = (pass % 2 == 0);
+                vk::DescriptorSet currentTileDS = isEvenPass ? tileMainDS : tileSwapDS;
+
+                commandBuffer->bindDescriptorSets(
+                    vk::PipelineBindPoint::eCompute, *pipelineLayout, 0, 1, &currentTileDS, 0, nullptr);
+
+                // --- Tile Histogram Pass (64-bit: reads TileSortKeyPair from binding 10) ---
+                commandBuffer->bindPipeline(vk::PipelineBindPoint::eCompute, *tileRadixHistogramPipeline);
+                uint32_t tileHistPC[3] = {shift, 0, 0};
+                commandBuffer->pushConstants<uint32_t>(
+                    *pipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, tileHistPC);
+                commandBuffer->dispatch(tileHistGroupCountActual, 1, 1);
+
+                vk::MemoryBarrier tileHistBarrier(
+                    vk::AccessFlagBits::eShaderWrite,
+                    vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite);
+                commandBuffer->pipelineBarrier(
+                    vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eComputeShader,
+                    vk::DependencyFlags(), 1, &tileHistBarrier, 0, nullptr, 0, nullptr);
+
+                // --- Tile Scan Pass (64-bit: reads histogram from binding 12) ---
+                commandBuffer->bindPipeline(vk::PipelineBindPoint::eCompute, *tileRadixScanPipeline);
+                uint32_t tileScanPC2[3] = {tileHistGroupCountActual, 0, 0};
+                commandBuffer->pushConstants<uint32_t>(
+                    *pipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, tileScanPC2);
+                commandBuffer->dispatch(1, 1, 1);
+
+                vk::MemoryBarrier tileScanPassBarrier(
+                    vk::AccessFlagBits::eShaderWrite,
+                    vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite);
+                commandBuffer->pipelineBarrier(
+                    vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eComputeShader,
+                    vk::DependencyFlags(), 1, &tileScanPassBarrier, 0, nullptr, 0, nullptr);
+
+                // --- Tile Scatter Pass (64-bit: reads TileSortKeyPair from binding 10, writes to binding 11) ---
+                commandBuffer->bindPipeline(vk::PipelineBindPoint::eCompute, *tileRadixScatterPipeline);
+                uint32_t tileScatterPC[3] = {shift, 0, 0};
+                commandBuffer->pushConstants<uint32_t>(
+                    *pipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, tileScatterPC);
+                commandBuffer->dispatch(tileHistGroupCountActual, 1, 1);
+
+                vk::MemoryBarrier tileScatterBarrier(
+                    vk::AccessFlagBits::eShaderWrite,
+                    vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite);
+                commandBuffer->pipelineBarrier(
+                    vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eComputeShader,
+                    vk::DependencyFlags(), 1, &tileScatterBarrier, 0, nullptr, 0, nullptr);
+            }
+
+            nvtxRangePop();
+
+            // ====== Stage G: Compute Rasterization ======
+            nvtxRangePushA("7. Compute Rasterization");
 
             vk::MemoryBarrier rasterizeBarrier(
                 vk::AccessFlagBits::eShaderWrite,
@@ -1096,7 +1442,8 @@ int main() {
                 vk::DependencyFlags(), 1, &rasterizeBarrier, 0, nullptr, 0, nullptr);
 
             commandBuffer->bindPipeline(vk::PipelineBindPoint::eCompute, *rasterizePipeline);
-            //uint32_t rasterizePC[3] = {static_cast<uint32_t>(pointData.size()), WIDTH, HEIGHT};
+            commandBuffer->bindDescriptorSets(
+                vk::PipelineBindPoint::eCompute, *pipelineLayout, 0, 1, &mainDS, 0, nullptr);
             uint32_t rasterizePC[3] = { 30000, WIDTH, HEIGHT };
             commandBuffer->pushConstants<uint32_t>(
                 *pipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, rasterizePC);
@@ -1172,7 +1519,6 @@ int main() {
                 &imageIndex,
                 nullptr
             );
-            // (void)vulkanDevice.getComputeQueue().presentKHR(presentInfo);
 
             try {
                 (void)vulkanDevice.getComputeQueue().presentKHR(presentInfo);
@@ -1232,6 +1578,115 @@ int main() {
             std::cout << "[System] === Touched Tiles Verification Complete ===" << std::endl;
 
             touchedTilesReadback.unmap();
+        }
+
+        // ============================================================
+        // Phase 15: Reverse DMA - Readback totalTileKeys & first 20 keys
+        // ============================================================
+        {
+            // 1. Readback prefix sum to get totalTileKeys
+            VmaBuffer prefixSumReadback(
+                vulkanDevice.getAllocator(),
+                tilePrefixSumBufferSize,
+                vk::BufferUsageFlagBits::eTransferDst,
+                VMA_MEMORY_USAGE_GPU_TO_CPU
+            );
+
+            vk::CommandBufferAllocateInfo prefixReadbackCmdBufInfo(
+                *commandPool, vk::CommandBufferLevel::ePrimary, 1);
+            auto prefixReadbackCmdBuffers = vulkanDevice.getDevice().allocateCommandBuffersUnique(prefixReadbackCmdBufInfo);
+            auto& prefixReadbackCmdBuffer = prefixReadbackCmdBuffers[0];
+
+            vk::CommandBufferBeginInfo prefixReadbackBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
+            prefixReadbackCmdBuffer->begin(prefixReadbackBeginInfo);
+
+            vk::BufferCopy prefixCopyRegion(0, 0, tilePrefixSumBufferSize);
+            prefixReadbackCmdBuffer->copyBuffer(
+                tilePrefixSumBuffer.getBuffer(),
+                prefixSumReadback.getBuffer(),
+                prefixCopyRegion
+            );
+
+            prefixReadbackCmdBuffer->end();
+
+            vk::SubmitInfo prefixSubmitInfo(0, nullptr, nullptr, 1, &*prefixReadbackCmdBuffer, 0, nullptr);
+            VK_CHECK(vulkanDevice.getComputeQueue().submit(1, &prefixSubmitInfo, nullptr));
+            vulkanDevice.getComputeQueue().waitIdle();
+
+            uint32_t* prefixData = static_cast<uint32_t*>(prefixSumReadback.map());
+            //uint32_t totalTileKeys = prefixData[paddedCount];
+            uint32_t totalTileKeys = prefixData[0];
+
+            std::cout << "\n[System] === Phase 15: Tile Explosion Verification ===" << std::endl;
+            std::cout << "[System] totalTileKeys (total exploded copies): " << totalTileKeys << std::endl;
+            std::cout << "[System] Expansion ratio: "
+                      << (pointData.size() > 0 ? static_cast<float>(totalTileKeys) / static_cast<float>(pointData.size()) : 0.0f)
+                      << "x" << std::endl;
+
+            uint32_t prefixPrintCount = std::min(static_cast<uint32_t>(10), static_cast<uint32_t>(pointData.size()));
+            for (uint32_t i = 0; i < prefixPrintCount; ++i) {
+                std::cout << "[System] tilePrefixSum[" << i << "] = " << prefixData[i] << std::endl;
+            }
+
+            prefixSumReadback.unmap();
+
+            // 2. Readback tile sort keys (first 20 elements)
+            if (totalTileKeys > 0) {
+                uint32_t readbackKeyCount = std::min(totalTileKeys, 20u);
+                vk::DeviceSize keyReadbackSize = static_cast<vk::DeviceSize>(readbackKeyCount) * sizeof(TileSortKeyPair);
+
+                VmaBuffer tileKeysReadback(
+                    vulkanDevice.getAllocator(),
+                    keyReadbackSize,
+                    vk::BufferUsageFlagBits::eTransferDst,
+                    VMA_MEMORY_USAGE_GPU_TO_CPU
+                );
+
+                vk::CommandBufferAllocateInfo keyReadbackCmdBufInfo(
+                    *commandPool, vk::CommandBufferLevel::ePrimary, 1);
+                auto keyReadbackCmdBuffers = vulkanDevice.getDevice().allocateCommandBuffersUnique(keyReadbackCmdBufInfo);
+                auto& keyReadbackCmdBuffer = keyReadbackCmdBuffers[0];
+
+                vk::CommandBufferBeginInfo keyReadbackBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
+                keyReadbackCmdBuffer->begin(keyReadbackBeginInfo);
+
+                vk::BufferCopy keyCopyRegion(0, 0, keyReadbackSize);
+                keyReadbackCmdBuffer->copyBuffer(
+                    tileSortKeyBuffer->getBuffer(),
+                    tileKeysReadback.getBuffer(),
+                    keyCopyRegion
+                );
+
+                keyReadbackCmdBuffer->end();
+
+                vk::SubmitInfo keySubmitInfo(0, nullptr, nullptr, 1, &*keyReadbackCmdBuffer, 0, nullptr);
+                VK_CHECK(vulkanDevice.getComputeQueue().submit(1, &keySubmitInfo, nullptr));
+                vulkanDevice.getComputeQueue().waitIdle();
+
+                TileSortKeyPair* keyData = static_cast<TileSortKeyPair*>(tileKeysReadback.map());
+
+                std::cout << "\n[System] === First " << readbackKeyCount << " 64-bit Tile Sort Keys ===" << std::endl;
+                for (uint32_t i = 0; i < readbackKeyCount; ++i) {
+                    uint64_t k = keyData[i].key;
+                    uint32_t tileID = static_cast<uint32_t>(k >> 32);
+                    uint32_t depthBits = static_cast<uint32_t>(k & 0xFFFFFFFFu);
+                    float depth;
+                    std::memcpy(&depth, &depthBits, sizeof(float));
+                    uint32_t gaussIdx = keyData[i].index;
+
+                    uint32_t tileY = numTilesX > 0 ? tileID / numTilesX : 0;
+                    uint32_t tileX = numTilesX > 0 ? tileID % numTilesX : 0;
+
+                    std::cout << "[System] Key[" << i << "]: tileID=" << tileID
+                              << " (tileX=" << tileX << ", tileY=" << tileY << ")"
+                              << ", depthBits=0x" << std::hex << std::setw(8) << std::setfill('0') << depthBits << std::dec
+                              << ", depth=" << depth
+                              << ", gaussianIndex=" << gaussIdx << std::endl;
+                }
+                std::cout << "[System] === Tile Sort Key Verification Complete ===" << std::endl;
+
+                tileKeysReadback.unmap();
+            }
         }
 
     } catch (const std::exception& e) {
