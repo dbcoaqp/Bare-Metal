@@ -239,6 +239,9 @@ public:
         vk::PhysicalDeviceVulkan13Features vulkan13Features{};
         vulkan13Features.synchronization2 = VK_TRUE;
 
+        vk::PhysicalDeviceFeatures deviceFeatures{};
+        deviceFeatures.shaderInt64 = VK_TRUE;
+
         const std::vector<const char*> deviceExtensions = {
             VK_KHR_SWAPCHAIN_EXTENSION_NAME
         };
@@ -249,7 +252,8 @@ public:
             &queueCreateInfo,
             0, nullptr,
             static_cast<uint32_t>(deviceExtensions.size()),
-            deviceExtensions.data()
+            deviceExtensions.data(),
+            &deviceFeatures
         );
         deviceCreateInfo.pNext = &vulkan13Features;
 
