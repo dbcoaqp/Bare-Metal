@@ -689,7 +689,7 @@ int main() {
         VmaBuffer tilePrefixSumBuffer(
             vulkanDevice.getAllocator(),
             tilePrefixSumBufferSize,
-            vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc,
+            vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst,
             VMA_MEMORY_USAGE_GPU_ONLY
         );
         std::cout << "[System] Tile prefix sum buffer created (" << tilePrefixSumBufferSize << " bytes)." << std::endl;
