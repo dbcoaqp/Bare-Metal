@@ -1,0 +1,52 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 9) readonly buffer TilePrefixSumBuffer {
+    uint tilePrefixSum[];
+};
+
+struct TileSortKeyPair {
+    uint64_t key;
+    uint index;
+};
+
+layout(std430, binding = 10) readonly buffer TileSortKeyBuffer {
+    TileSortKeyPair tileSortKeys[];
+};
+
+layout(std430, binding = 14) buffer TilePointersBuffer {
+    uvec2 pointers[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint paddedCount;
+    uint _pad1;
+    uint _pad2;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+
+    // Read total number of exploded keys from the atomic counter (tilePrefixSum[0])
+    uint totalKeys = tilePrefixSum[0];
+
+    if (idx >= totalKeys) return;
+
+    // Extract this element's tileID (upper 32 bits of the 64-bit key)
+    uint tileID = uint(tileSortKeys[idx].key >> 32u);
+
+    // Extract previous element's tileID (boundary sentinel for idx == 0)
+    uint prevTileID = (idx == 0u) ? ~0u : uint(tileSortKeys[idx - 1u].key >> 32u);
+
+    // Extract next element's tileID (boundary sentinel for idx == totalKeys - 1)
+    uint nextTileID = (idx == totalKeys - 1u) ? ~0u : uint(tileSortKeys[idx + 1u].key >> 32u);
+
+    // Boundary detection: mark tile start and end
+    if (tileID != prevTileID) {
+        pointers[tileID].x = idx;        // Start index (inclusive)
+    }
+    if (tileID != nextTileID) {
+        pointers[tileID].y = idx + 1u;   // End index (exclusive)
+    }
+}

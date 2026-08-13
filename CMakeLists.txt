@@ -51,6 +51,9 @@ set(TILE_RADIX_SCAN_SHADER_BIN "${CMAKE_SOURCE_DIR}/shaders/tile_radix_scan.spv"
 set(TILE_RADIX_SCATTER_SHADER_SRC "${CMAKE_SOURCE_DIR}/shaders/tile_radix_scatter.comp")
 set(TILE_RADIX_SCATTER_SHADER_BIN "${CMAKE_SOURCE_DIR}/shaders/tile_radix_scatter.spv")
 
+set(TILE_POINTERS_SHADER_SRC "${CMAKE_SOURCE_DIR}/shaders/tile_pointers.comp")
+set(TILE_POINTERS_SHADER_BIN "${CMAKE_SOURCE_DIR}/shaders/tile_pointers.spv")
+
 add_custom_command(
     OUTPUT ${SHADER_BIN}
     COMMAND ${GLSLC} ${SHADER_SRC} -o ${SHADER_BIN}
@@ -128,6 +131,13 @@ add_custom_command(
     COMMENT "Compiling compute shader: tile_radix_scatter.comp -> tile_radix_scatter.spv"
 )
 
+add_custom_command(
+    OUTPUT ${TILE_POINTERS_SHADER_BIN}
+    COMMAND ${GLSLC} ${TILE_POINTERS_SHADER_SRC} -o ${TILE_POINTERS_SHADER_BIN}
+    DEPENDS ${TILE_POINTERS_SHADER_SRC}
+    COMMENT "Compiling compute shader: tile_pointers.comp -> tile_pointers.spv"
+)
+
 add_custom_target(CompileShaders ALL DEPENDS 
     ${SHADER_BIN} 
     ${RADIX_HISTOGRAM_SHADER_BIN} 
@@ -139,7 +149,8 @@ add_custom_target(CompileShaders ALL DEPENDS
     ${TILE_DUPLICATE_SHADER_BIN}
     ${TILE_RADIX_HISTOGRAM_SHADER_BIN}
     ${TILE_RADIX_SCAN_SHADER_BIN}
-    ${TILE_RADIX_SCATTER_SHADER_BIN})
+    ${TILE_RADIX_SCATTER_SHADER_BIN}
+    ${TILE_POINTERS_SHADER_BIN})
 
 include_directories(${Vulkan_INCLUDE_DIRS})
 include_directories(${CMAKE_SOURCE_DIR})
