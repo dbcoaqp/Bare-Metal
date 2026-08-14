@@ -1,59 +1,30 @@
 #version 460
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 layout(local_size_x = 256) in;
-
-struct TileSortKeyPair {
-    uint64_t key;
-    uint index;
-};
-
-layout(std430, binding = 10) readonly buffer TileSrcBuffer {
-    TileSortKeyPair src[];
-};
-
-layout(std430, binding = 11) buffer TileDstBuffer {
-    TileSortKeyPair dst[];
-};
-
-layout(std430, binding = 12) readonly buffer TileHistogramBuffer {
-    uint histogram[];
-};
-
-layout(std430, binding = 13) buffer TileOffsetBuffer {
-    uint offsets[];
-};
-
-layout(push_constant) uniform PushConstants {
-    uint shift;
-    uint _pad1;
-    uint _pad2;
-} pc;
-
-shared uint localHist[256];
+struct TileSortKeyPair { uint64_t key; uint index; };
+layout(std430, binding = 10) readonly buffer TileSrcBuffer { TileSortKeyPair src[]; };
+layout(std430, binding = 11) buffer TileDstBuffer { TileSortKeyPair dst[]; };
+layout(std430, binding = 12) readonly buffer TileHistogramBuffer { uint histogram[]; };
+layout(std430, binding = 13) readonly buffer TileOffsetBuffer { uint offsets[]; };
+layout(push_constant) uniform PushConstants { uint shift; uint _pad1; uint _pad2; } pc;
 shared uint wgBaseOffset[256];
-shared uint localCounter[256];
-
+shared uint sharedBuckets[256];
 void main() {
     uint tid = gl_LocalInvocationID.x;
     uint gid = gl_GlobalInvocationID.x;
     uint wgId = gl_WorkGroupID.x;
-
-    // Phase 1: Load this workgroup's local histogram from the global buffer
-    localHist[tid] = histogram[wgId * 256 + tid];
+    
+    wgBaseOffset[tid] = offsets[tid] + histogram[wgId * 256 + tid];
     barrier();
 
-    // Phase 2: Atomically claim space from global offsets
-    wgBaseOffset[tid] = atomicAdd(offsets[tid], localHist[tid]);
+    // Remove the .length() limit!
+    sharedBuckets[tid] = uint((src[gid].key >> pc.shift) & 0xFFu);
     barrier();
 
-    // Phase 3: Each thread determines its local rank and scatters to destination
-    localCounter[tid] = 0u;
-    barrier();
-
-    if (gid < src.length()) {
-        uint bucket = uint((src[gid].key >> pc.shift) & 0xFFu);
-        uint localRank = atomicAdd(localCounter[bucket], 1u);
-        uint finalPos = wgBaseOffset[bucket] + localRank;
-        dst[finalPos] = src[gid];
+    uint myBucket = sharedBuckets[tid];
+    uint localRank = 0;
+    for (uint i = 0; i < tid; i++) {
+        if (sharedBuckets[i] == myBucket) localRank++;
     }
+    dst[wgBaseOffset[myBucket] + localRank] = src[gid];
 }

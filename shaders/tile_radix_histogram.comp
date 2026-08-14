@@ -1,45 +1,23 @@
 #version 460
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 layout(local_size_x = 256) in;
-
-struct TileSortKeyPair {
-    uint64_t key;
-    uint index;
-};
-
-layout(std430, binding = 10) readonly buffer TileSrcBuffer {
-    TileSortKeyPair src[];
-};
-
-layout(std430, binding = 12) buffer TileHistogramBuffer {
-    uint histogram[];
-};
-
-layout(push_constant) uniform PushConstants {
-    uint shift;
-    uint _pad1;
-    uint _pad2;
-} pc;
-
+struct TileSortKeyPair { uint64_t key; uint index; };
+layout(std430, binding = 10) readonly buffer TileSrcBuffer { TileSortKeyPair src[]; };
+layout(std430, binding = 12) buffer TileHistogramBuffer { uint histogram[]; };
+layout(push_constant) uniform PushConstants { uint shift; uint _pad1; uint _pad2; } pc;
 shared uint localHist[256];
-
 void main() {
     uint tid = gl_LocalInvocationID.x;
     uint gid = gl_GlobalInvocationID.x;
     uint wgId = gl_WorkGroupID.x;
 
-    // Initialize shared memory histogram to zero
     localHist[tid] = 0;
     barrier();
 
-    // Each thread reads its 16-byte TileSortKeyPair element and atomically increments the bucket
-    if (gid < src.length()) {
-        uint bucket = uint((src[gid].key >> pc.shift) & 0xFFu);
-        atomicAdd(localHist[bucket], 1u);
-    }
+    // Remove the .length() limit!
+    uint bucket = uint((src[gid].key >> pc.shift) & 0xFFu);
+    atomicAdd(localHist[bucket], 1u);
     barrier();
 
-    // Write this workgroup's local histogram to the global buffer
-    // Layout: histogram[workgroupID * 256 + bucket]
     histogram[wgId * 256 + tid] = localHist[tid];
 }

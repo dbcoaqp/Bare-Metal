@@ -22,7 +22,7 @@ layout(std430, binding = 3) readonly buffer Gaussian2DBuffer {
     Gaussian2D gaussians2D[];
 };
 
-layout(std430, binding = 9) readonly buffer TilePrefixSumBuffer {
+layout(std430, binding = 9) buffer TilePrefixSumBuffer {
     uint tilePrefixSum[];
 };
 
@@ -48,12 +48,11 @@ void main() {
     uint max_tx = g.bounds[2];
     uint max_ty = g.bounds[3];
 
-    // Recompute depth key from linear depth (IEEE 754 float-to-sortable-uint)
+    // THE ULTIMATE MATH FIX: Strict Descending Order
+    // Positive depths (in front of camera) flip to small uints.
+    // Negative depths (ghosts behind camera) stay huge uints and sink to the bottom.
     uint depthKey = floatBitsToUint(g.depth);
-    depthKey = (depthKey & 0x80000000u) == 0u ? (~depthKey) : (depthKey ^ 0x80000000u);
-
-    // Get base write offset from prefix sum (read-only after tile_scan + barrier)
-    // uint writeOffset = tilePrefixSum[idx];
+    depthKey = (depthKey & 0x80000000u) == 0u ? (~depthKey) : depthKey;
 
     // Nested loop: spawn a copy for each touched tile
     for (uint y = min_ty; y < max_ty; y++) {
@@ -65,8 +64,6 @@ void main() {
 
             tileSortKeys[writeOffset].key = key64;
             tileSortKeys[writeOffset].index = idx;
-
-            writeOffset++;
         }
     }
 }

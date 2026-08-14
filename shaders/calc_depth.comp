@@ -1,5 +1,4 @@
 #version 460
-
 layout (local_size_x = 256) in;
 
 struct GaussianPoint {
@@ -38,16 +37,14 @@ layout(std140, binding = 2) uniform CameraUBO {
 void main() {
     uint index = gl_GlobalInvocationID.x;
     
-    // Guard against out-of-bounds access
     if (index >= gaussians.length()) return;
     
     vec3 pos = gaussians[index].position;
     float depth = dot(pos - cameraPosition.xyz, cameraForward.xyz);
     
-    // IEEE 754 float-to-sortable-uint transformation for ascending depth order
+    // IEEE 754 float-to-sortable-uint transformation for strict DESCENDING order
     uint depthKey = floatBitsToUint(depth);
-    // Negative (sign bit=1): flip all bits; Positive (sign bit=0): flip sign bit
-    depthKey = (depthKey & 0x80000000u) == 0u ? (~depthKey) : (depthKey ^ 0x80000000u);
+    depthKey = (depthKey & 0x80000000u) == 0u ? (~depthKey) : depthKey;
     
     sortKeys[index].key = depthKey;
     sortKeys[index].index = index;

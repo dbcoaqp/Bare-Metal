@@ -1,49 +1,27 @@
 #version 460
 layout(local_size_x = 256) in;
-
-layout(std430, binding = 12) readonly buffer TileHistogramBuffer {
-    uint histogram[];
-};
-
-layout(std430, binding = 13) buffer TileOffsetBuffer {
-    uint offsets[];
-};
-
-layout(push_constant) uniform PushConstants {
-    uint numWorkgroups;
-    uint _pad1;
-    uint _pad2;
-} pc;
-
+layout(std430, binding = 12) buffer TileHistogramBuffer { uint histogram[]; };
+layout(std430, binding = 13) buffer TileOffsetBuffer { uint offsets[]; };
+layout(push_constant) uniform PushConstants { uint numWorkgroups; uint _pad1; uint _pad2; } pc;
 shared uint sharedData[256];
-
 void main() {
     uint tid = gl_LocalInvocationID.x;
-
-    // Phase 1: Sum across all workgroups for this bucket
-    // Each thread handles one bucket (tid = bucket index 0..255)
     uint sum = 0u;
     for (uint wg = 0u; wg < pc.numWorkgroups; wg++) {
-        sum += histogram[wg * 256 + tid];
+        uint count = histogram[wg * 256 + tid];
+        histogram[wg * 256 + tid] = sum; 
+        sum += count;
     }
-
     sharedData[tid] = sum;
     barrier();
-
-    // Phase 2: Exclusive prefix sum using Hillis-Steele scan
     uint original = sharedData[tid];
     barrier();
-
     for (uint stride = 1u; stride < 256u; stride <<= 1u) {
         uint val = 0u;
-        if (tid >= stride) {
-            val = sharedData[tid - stride];
-        }
+        if (tid >= stride) val = sharedData[tid - stride];
         barrier();
         sharedData[tid] += val;
         barrier();
     }
-
-    // Convert inclusive prefix sum to exclusive prefix sum
     offsets[tid] = sharedData[tid] - original;
 }
