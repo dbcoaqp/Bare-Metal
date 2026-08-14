@@ -1541,12 +1541,15 @@ int main() {
             commandBuffer->bindPipeline(vk::PipelineBindPoint::eCompute, *rasterizePipeline);
             commandBuffer->bindDescriptorSets(
                 vk::PipelineBindPoint::eCompute, *pipelineLayout, 0, 1, &mainDS, 0, nullptr);
-            uint32_t rasterizePC[3] = { 30000, WIDTH, HEIGHT };
+            uint32_t rasterizePC[3] = { WIDTH, HEIGHT, numTilesX };
             commandBuffer->pushConstants<uint32_t>(
                 *pipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, rasterizePC);
+            /*
             uint32_t rasterizeGroupCountX = (WIDTH + 15) / 16;
             uint32_t rasterizeGroupCountY = (HEIGHT + 15) / 16;
             commandBuffer->dispatch(rasterizeGroupCountX, rasterizeGroupCountY, 1);
+            */
+            commandBuffer->dispatch(numTilesX, numTilesY, 1);
 
             // Image copy: buffer -> swapchain image
             vk::MemoryBarrier computeToTransferBarrier(

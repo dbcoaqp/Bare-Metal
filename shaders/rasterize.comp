@@ -8,51 +8,97 @@ struct Gaussian2D {
     vec3 conic;
     float pad1;
     vec3 color;
-    uint bounds[4];     // min_tx, min_ty, max_tx, max_ty
+    uint bounds[4];
     float pad2;
+};
+
+struct TileSortKeyPair {
+    uint64_t key;
+    uint index;
 };
 
 layout(std430, binding = 3) readonly buffer Gaussian2DBuffer {
     Gaussian2D gaussians2D[];
 };
 
-layout(std430, binding = 4) buffer ImageBuffer {
-    uint pixels[];
+layout(std430, binding = 4) writeonly buffer ImageBuffer {
+    uint image[];
+};
+
+layout(std430, binding = 10) readonly buffer TileSortKeyBuffer {
+    TileSortKeyPair tileSortKeys[];
+};
+
+layout(std430, binding = 14) readonly buffer TilePointersBuffer {
+    uvec2 pointers[];
 };
 
 layout(push_constant) uniform PushConstants {
-    uint gaussianCount;
     uint width;
     uint height;
+    uint numTilesX;
 } pc;
 
+
+shared Gaussian2D chunkData[256];
+
 void main() {
-    uvec2 pixel = gl_GlobalInvocationID.xy;
+    uint tileX = gl_WorkGroupID.x;
+    uint tileY = gl_WorkGroupID.y;
+    uint tileID = tileY * pc.numTilesX + tileX;
 
-    if (pixel.x >= pc.width || pixel.y >= pc.height) return;
+    // Obtain the Gaussian sphere interval for the current tile.
+    uvec2 ptr = pointers[tileID];
+    uint startIdx = ptr.x;
+    uint endIdx = ptr.y;
 
-    vec3 finalColor = vec3(0.0);
+    // The current thread within the block, and the pixel coordinates it responsible for.
+    uint tid = gl_LocalInvocationIndex; 
+    uvec2 pixelCoord = gl_GlobalInvocationID.xy;
 
-    for (uint i = 0; i < pc.gaussianCount; i++) {
-        Gaussian2D g = gaussians2D[i];
+    vec3 color = vec3(0.0);
+    float T = 1.0;
 
-        vec2 d = vec2(pixel) - g.pos2D;
+    uint numPasses = (endIdx - startIdx + 255) / 256;
 
-        float power = -0.5 * (g.conic.x * d.x * d.x + g.conic.z * d.y * d.y + 2.0 * g.conic.y * d.x * d.y);
+    for (uint pass = 0; pass < numPasses; pass++) {
+        uint globalIdx = startIdx + pass * 256 + tid;
+        
+        // 256 threads simultaneously fetch data from VRAM and load it into the L1 cache.
+        if (globalIdx < endIdx) {
+            chunkData[tid] = gaussians2D[tileSortKeys[globalIdx].index];
+        }
+        barrier(); // Once all the data is in place
 
-        if (power > 0.0) continue;
+        // The 256 pixel threads each iterate through these 256 Gaussian points.
+        uint validCount = min(256u, endIdx - (startIdx + pass * 256));
+        for (uint i = 0; i < validCount; i++) {
+            // If the current pixel is already fully opaque, skip the calculation.
+            if (T < 0.0001) continue;
 
-        float alpha = min(0.99, g.opacity * exp(power));
+            Gaussian2D g = chunkData[i];
+            vec2 d = vec2(pixelCoord) - g.pos2D;
+            
+            float power = -0.5 * (g.conic.x * d.x * d.x + g.conic.z * d.y * d.y) - g.conic.y * d.x * d.y;
+            if (power > 0.0) continue;
+            
+            float alpha = min(0.99f, g.opacity * exp(power));
+            if (alpha < 1.0 / 255.0) continue;
 
-        if (alpha < 1.0 / 255.0) continue;
-
-        finalColor = mix(finalColor, g.color, alpha);
+            // Alpha Blending
+            color += g.color * alpha * T;
+            T = T * (1.0 - alpha);
+        }
+        barrier(); // Once all the pixels are finished, ready to transfer the next batch.
     }
 
-    uint r = uint(clamp(finalColor.r, 0.0, 1.0) * 255.0);
-    uint g = uint(clamp(finalColor.g, 0.0, 1.0) * 255.0);
-    uint b = uint(clamp(finalColor.b, 0.0, 1.0) * 255.0);
-    uint a = 255u;
-    uint idx = pixel.y * pc.width + pixel.x;
-    pixels[idx] = b | (g << 8u) | (r << 16u) | (a << 24u);
+    // 4. Pack and write the final calculated color into the ImageBuffer (BGRA8 Unorm format).
+    if (pixelCoord.x < pc.width && pixelCoord.y < pc.height) {
+        uint r = uint(clamp(color.r, 0.0, 1.0) * 255.0);
+        uint g = uint(clamp(color.g, 0.0, 1.0) * 255.0);
+        uint b = uint(clamp(color.b, 0.0, 1.0) * 255.0);
+        
+        uint finalColor = (255u << 24) | (r << 16) | (g << 8) | b;
+        image[pixelCoord.y * pc.width + pixelCoord.x] = finalColor;
+    }
 }
