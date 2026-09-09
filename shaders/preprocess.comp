@@ -2,10 +2,9 @@
 layout(local_size_x = 256) in;
 
 struct GaussianPoint {
-    vec3 position;
-    float scale;
-    vec3 color;
-    float opacity;
+    vec3 position; float opacity;
+    vec3 scale;    float pad1;
+    vec3 color;    float pad2;
     vec4 rot;
 };
 
@@ -110,13 +109,11 @@ void main() {
 
     // 4. Build 3D rotation matrix and extract uniform scale
     mat3 R = buildRotationMatrix(gp.rot);
-    // float s = gp.scale;
+    mat3 S = mat3(gp.scale.x, 0.0, 0.0,
+                  0.0, gp.scale.y, 0.0,
+                  0.0, 0.0, gp.scale.z);
+    mat3 M = R * S; 
 
-    // shrunk by 20 to prevent the test data from being too large and filling the screen.
-    float s = gp.scale * 0.05;
-
-    // forced them to be red to eliminate the interference if NPY is gray.
-    gp.color = vec3(1.0, 0.2, 0.2);
 
     // 5. Compute the Jacobian of the full viewProj -> screen transformation
     //    This directly computes T = J * W (projection Jacobian * view rotation)
@@ -134,12 +131,16 @@ void main() {
     // 6. Compute 2D covariance: Σ' = T * Σ_3d * T^T
     //    Σ_3d = R * S² * R^T, so we compute v_i = S * R^T * T[i]
     //    Then Σ'[i][j] = dot(v_i, v_j)
-    vec3 v0 = s * (transpose(R) * jacobianRow0);
-    vec3 v1 = s * (transpose(R) * jacobianRow1);
+    // vec3 v0 = s * (transpose(R) * jacobianRow0);
+    // vec3 v1 = s * (transpose(R) * jacobianRow1);
 
-    float sigma_xx = dot(v0, v0);
+    
+    vec3 v0 = jacobianRow0 * M;
+    vec3 v1 = jacobianRow1 * M;
+
+    float sigma_xx = dot(v0, v0) + 0.3;
     float sigma_xy = dot(v0, v1);
-    float sigma_yy = dot(v1, v1);
+    float sigma_yy = dot(v1, v1) + 0.3;
 
     // ============================================================
     // Phase 13: Compute 2D ellipse pixel radius from eigenvalues
