@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <fstream>
 #include <cmath>
+#include <chrono>
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -33,48 +34,37 @@
 #include "core/Camera.h"
 #include "utils/NpyParser.h"
 #include "core/Gaussian2D.h"
-#include "core/MathUtils.h"
 
 // Global function pointer table memory allocation
 VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE;
 
-// ============================================================
-// Phase 10: Mouse state globals for camera control
-// ============================================================
+// GLFW callbacks accumulate input; the render loop applies it to the camera.
 static double lastMouseX = 0.0;
 static double lastMouseY = 0.0;
-static float yaw = -90.0f;   // Initial yaw: looking along +Z (toward origin)
-static float pitch = 0.0f;
-static bool isLeftMouseDown = false;
-
-static void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
-    (void)mods;
-    if (button == GLFW_MOUSE_BUTTON_LEFT) {
-        if (action == GLFW_PRESS) {
-            isLeftMouseDown = true;
-            glfwGetCursorPos(window, &lastMouseX, &lastMouseY);
-        } else if (action == GLFW_RELEASE) {
-            isLeftMouseDown = false;
-        }
-    }
-}
+static float pendingMouseX = 0.0f;
+static float pendingMouseY = 0.0f;
+static bool keyForward = false;
+static bool keyBackward = false;
+static bool keyLeft = false;
+static bool keyRight = false;
 
 static void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
     (void)window;
-    if (!isLeftMouseDown) return;
-
-    float xOffset = static_cast<float>(xpos - lastMouseX);
-    float yOffset = static_cast<float>(lastMouseY - ypos); // y-axis inverted
-
+    pendingMouseX += static_cast<float>(xpos - lastMouseX);
+    pendingMouseY += static_cast<float>(lastMouseY - ypos);
     lastMouseX = xpos;
     lastMouseY = ypos;
+}
 
-    float sensitivity = 0.1f;
-    yaw += xOffset * sensitivity;
-    pitch += yOffset * sensitivity;
-
-    if (pitch > 89.0f) pitch = 89.0f;
-    if (pitch < -89.0f) pitch = -89.0f;
+static void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods) {
+    (void)window;
+    (void)scancode;
+    (void)mods;
+    const bool pressed = action != GLFW_RELEASE;
+    if (key == GLFW_KEY_W) keyForward = pressed;
+    if (key == GLFW_KEY_S) keyBackward = pressed;
+    if (key == GLFW_KEY_A) keyLeft = pressed;
+    if (key == GLFW_KEY_D) keyRight = pressed;
 }
 
 class GlfwGuard {
@@ -401,8 +391,9 @@ int main() {
         // ===== Phase 9: Create GLFW Window & Surface =====
         GlfwWindow window(WIDTH, HEIGHT, "Bare Metal 3DGS");
 
-        glfwSetMouseButtonCallback(window.get(), mouseButtonCallback);
+        glfwSetInputMode(window.get(), GLFW_CURSOR, GLFW_CURSOR_DISABLED);
         glfwSetCursorPosCallback(window.get(), cursorPosCallback);
+        glfwSetKeyCallback(window.get(), keyCallback);
         glfwGetCursorPos(window.get(), &lastMouseX, &lastMouseY);
 
         WindowSurface surface(vkInstance.get(), window.get());
@@ -569,28 +560,25 @@ int main() {
         std::cout << "[System] DMA Transfer Complete: Gaussian data injected into Device Local VRAM." << std::endl;
 
         // 6. Camera buffer
-        constexpr float PI = 3.14159265358979f;
-
         CameraUniform cameraData{};
 
-        // Compute initial forward from yaw/pitch
-        float radYaw = yaw * PI / 180.0f;
-        float radPitch = pitch * PI / 180.0f;
-        float initFwdX = std::cos(radPitch) * std::cos(radYaw);
-        float initFwdY = std::sin(radPitch);
-        float initFwdZ = std::cos(radPitch) * std::sin(radYaw);
+        Camera camera;
+        const glm::vec3 initialForward = camera.getForward();
 
-        cameraData.cameraPosition[0] = 0.0f;
-        cameraData.cameraPosition[1] = 0.0f;
-        cameraData.cameraPosition[2] = 5.0f;
+        cameraData.cameraPosition[0] = camera.position.x;
+        cameraData.cameraPosition[1] = camera.position.y;
+        cameraData.cameraPosition[2] = camera.position.z;
         cameraData.cameraPosition[3] = 0.0f;
-        cameraData.cameraForward[0] = initFwdX;
-        cameraData.cameraForward[1] = initFwdY;
-        cameraData.cameraForward[2] = initFwdZ;
+        cameraData.cameraForward[0] = initialForward.x;
+        cameraData.cameraForward[1] = initialForward.y;
+        cameraData.cameraForward[2] = initialForward.z;
         cameraData.cameraForward[3] = 0.0f;
 
-        MathUtils::buildViewProjection(cameraData.viewProj, 0.0f, 0.0f, 5.0f,
-            initFwdX, initFwdY, initFwdZ, WIDTH, HEIGHT);
+        const glm::mat4 initialProjection = glm::perspectiveRH_ZO(glm::radians(57.29578f),
+            static_cast<float>(WIDTH) / static_cast<float>(HEIGHT), 0.1f, 100.0f);
+        glm::mat4 initialViewProj = initialProjection * camera.getViewMatrix();
+        initialViewProj[1][1] *= -1.0f;
+        std::memcpy(cameraData.viewProj, &initialViewProj, sizeof(cameraData.viewProj));
 
         cameraData.focal_x = 1000.0f;
         cameraData.focal_y = 1000.0f;
@@ -612,7 +600,7 @@ int main() {
         std::memcpy(mappedCameraData, &cameraData, sizeof(CameraUniform));
         cameraBuffer.flush();
         std::cout << "[System] Camera buffer created (persistent mapped), position (0, 0, 5), forward ("
-                  << initFwdX << ", " << initFwdY << ", " << initFwdZ << "), yaw=" << yaw << std::endl;
+                  << initialForward.x << ", " << initialForward.y << ", " << initialForward.z << ")" << std::endl;
 
         // 7. Sort key buffer
         vk::DeviceSize sortKeyBufferSize = static_cast<vk::DeviceSize>(paddedCount) * sizeof(SortKeyPair);
@@ -1235,31 +1223,44 @@ int main() {
         std::cout << "[System] Entering render loop..." << std::endl;
 
         // ===== Phase 10: The Async Hot Loop (Radix Sort) =====
+        auto previousFrameTime = std::chrono::steady_clock::now();
         while (!glfwWindowShouldClose(window.get())) {
             glfwPollEvents();
+
+            const auto currentTime = std::chrono::steady_clock::now();
+            const float deltaTime = std::chrono::duration<float>(currentTime - previousFrameTime).count();
+            previousFrameTime = currentTime;
+
+            camera.processMouse(pendingMouseX, pendingMouseY);
+            pendingMouseX = 0.0f;
+            pendingMouseY = 0.0f;
+            const glm::vec3 movement(
+                static_cast<float>(keyRight) - static_cast<float>(keyLeft),
+                0.0f,
+                static_cast<float>(keyForward) - static_cast<float>(keyBackward));
+            camera.processKeyboard(movement, deltaTime);
+
+            // The descriptor sets share one mapped UBO, so finish all earlier GPU reads
+            // before overwriting it with this frame's camera state.
+            VK_CHECK(vulkanDevice.getDevice().waitIdle());
 
             // Wait for the specific frame's GPU work to complete
             VK_CHECK(vulkanDevice.getDevice().waitForFences(*renderFences[currentFrame], VK_TRUE, UINT64_MAX));
             vulkanDevice.getDevice().resetFences(*renderFences[currentFrame]);
 
-            // Update camera from mouse input
-            float radYaw = yaw * PI / 180.0f;
-            float radPitch = pitch * PI / 180.0f;
-            float fwdX = std::cos(radPitch) * std::cos(radYaw);
-            float fwdY = std::sin(radPitch);
-            float fwdZ = std::cos(radPitch) * std::sin(radYaw);
-
-            mappedCameraData->cameraForward[0] = fwdX;
-            mappedCameraData->cameraForward[1] = fwdY;
-            mappedCameraData->cameraForward[2] = fwdZ;
-            mappedCameraData->cameraForward[3] = 0.0f;
-            mappedCameraData->cameraPosition[0] = 0.0f;
-            mappedCameraData->cameraPosition[1] = 0.0f;
-            mappedCameraData->cameraPosition[2] = 5.0f;
+            const glm::vec3 forward = camera.getForward();
+            mappedCameraData->cameraPosition[0] = camera.position.x;
+            mappedCameraData->cameraPosition[1] = camera.position.y;
+            mappedCameraData->cameraPosition[2] = camera.position.z;
             mappedCameraData->cameraPosition[3] = 0.0f;
+            mappedCameraData->cameraForward[0] = forward.x;
+            mappedCameraData->cameraForward[1] = forward.y;
+            mappedCameraData->cameraForward[2] = forward.z;
+            mappedCameraData->cameraForward[3] = 0.0f;
 
-            MathUtils::buildViewProjection(mappedCameraData->viewProj, 0.0f, 0.0f, 5.0f,
-                fwdX, fwdY, fwdZ, WIDTH, HEIGHT);
+            glm::mat4 viewProj = initialProjection * camera.getViewMatrix();
+            viewProj[1][1] *= -1.0f;
+            std::memcpy(mappedCameraData->viewProj, &viewProj, sizeof(mappedCameraData->viewProj));
             cameraBuffer.flush();
             
             uint32_t imageIndex;

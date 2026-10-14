@@ -1,6 +1,14 @@
 cmake_minimum_required(VERSION 3.20)
 project(BareMetalComputeProbe)
 
+include(FetchContent)
+FetchContent_Declare(glm
+    GIT_REPOSITORY https://github.com/g-truc/glm.git
+    GIT_TAG 1.0.1
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(glm)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -170,3 +178,5 @@ target_compile_definitions(BareMetalComputeProbe PRIVATE
     SHADER_DIR="${CMAKE_SOURCE_DIR}/shaders"
 )
 target_link_libraries(BareMetalComputeProbe PRIVATE Vulkan::Vulkan VulkanMemoryAllocator glfw nvToolsExt64_1.lib)
+target_link_libraries(BareMetalComputeProbe PRIVATE glm::glm)
+target_compile_definitions(BareMetalComputeProbe PRIVATE GLM_FORCE_DEPTH_ZERO_TO_ONE GLM_FORCE_LEFT_HANDED)
