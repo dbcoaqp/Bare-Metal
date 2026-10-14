@@ -9,6 +9,29 @@ FetchContent_Declare(glm
 )
 FetchContent_MakeAvailable(glm)
 
+FetchContent_Declare(imgui
+    GIT_REPOSITORY https://github.com/ocornut/imgui.git
+    GIT_TAG v1.91.0
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(imgui)
+
+# Build Dear ImGui as a static library with Vulkan + GLFW backends
+add_library(imgui_vk STATIC
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui_demo.cpp
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
+)
+target_include_directories(imgui_vk PUBLIC
+    ${imgui_SOURCE_DIR}
+    ${imgui_SOURCE_DIR}/backends
+)
+target_link_libraries(imgui_vk PUBLIC Vulkan::Vulkan glfw)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -165,10 +188,12 @@ include_directories(${CMAKE_SOURCE_DIR})
 include_directories(${CMAKE_SOURCE_DIR}/utils)
 include_directories(${CMAKE_SOURCE_DIR}/core)
 
-# NVTX v3 is header-only — add its default install path for Nsight Systems profiling
-include_directories("C:/Program Files/NVIDIA Corporation/NvToolsExt/include")
-link_directories("C:/Program Files/NVIDIA Corporation/NvToolsExt/lib/x64")
-include_directories("C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v11.4/include")
+# NVTX v3 is header-only — add its default install path for Nsight Systems profiling (Windows only)
+if(WIN32)
+    include_directories("C:/Program Files/NVIDIA Corporation/NvToolsExt/include")
+    link_directories("C:/Program Files/NVIDIA Corporation/NvToolsExt/lib/x64")
+    include_directories("C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v11.4/include")
+endif()
 
 add_executable(BareMetalComputeProbe main.cpp)
 add_dependencies(BareMetalComputeProbe CompileShaders)
@@ -177,6 +202,10 @@ target_compile_definitions(BareMetalComputeProbe PRIVATE
     VULKAN_HPP_DISPATCH_LOADER_DYNAMIC=1
     SHADER_DIR="${CMAKE_SOURCE_DIR}/shaders"
 )
-target_link_libraries(BareMetalComputeProbe PRIVATE Vulkan::Vulkan VulkanMemoryAllocator glfw nvToolsExt64_1.lib)
-target_link_libraries(BareMetalComputeProbe PRIVATE glm::glm)
+if(WIN32)
+    target_link_libraries(BareMetalComputeProbe PRIVATE Vulkan::Vulkan VulkanMemoryAllocator glfw nvToolsExt64_1.lib)
+else()
+    target_link_libraries(BareMetalComputeProbe PRIVATE Vulkan::Vulkan VulkanMemoryAllocator glfw)
+endif()
+target_link_libraries(BareMetalComputeProbe PRIVATE glm::glm imgui_vk)
 target_compile_definitions(BareMetalComputeProbe PRIVATE GLM_FORCE_DEPTH_ZERO_TO_ONE GLM_FORCE_LEFT_HANDED)

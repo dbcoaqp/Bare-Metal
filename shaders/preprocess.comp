@@ -41,7 +41,8 @@ layout(std140, binding = 2) uniform CameraUBO {
     float tan_fovx;
     float tan_fovy;
     vec2 viewport;
-    vec2 pad_cam;
+    float filterDilation;
+    float scaleModifier;
 };
 
 layout(std430, binding = 3) buffer Gaussian2DBuffer {
@@ -51,6 +52,11 @@ layout(std430, binding = 3) buffer Gaussian2DBuffer {
 // Phase 13: Touched tiles output buffer
 layout(std430, binding = 8) buffer TouchedTilesBuffer {
     uint touchedTiles[];
+};
+
+// Phase 19b: Tile prefix sum buffer (reuse last element for atomic visible count)
+layout(std430, binding = 9) buffer TilePrefixSumBuffer {
+    uint tilePrefixSum[];
 };
 
 // Build rotation matrix from quaternion (w, x, y, z)
@@ -109,9 +115,9 @@ void main() {
 
     // 4. Build 3D rotation matrix and extract uniform scale
     mat3 R = buildRotationMatrix(gp.rot);
-    mat3 S = mat3(gp.scale.x, 0.0, 0.0,
-                  0.0, gp.scale.y, 0.0,
-                  0.0, 0.0, gp.scale.z);
+    mat3 S = mat3(gp.scale.x * scaleModifier, 0.0, 0.0,
+                  0.0, gp.scale.y * scaleModifier, 0.0,
+                  0.0, 0.0, gp.scale.z * scaleModifier);
     mat3 M = R * S; 
 
 
@@ -138,9 +144,9 @@ void main() {
     vec3 v0 = jacobianRow0 * M;
     vec3 v1 = jacobianRow1 * M;
 
-    float sigma_xx = dot(v0, v0) + 0.3;
+    float sigma_xx = dot(v0, v0) + filterDilation;
     float sigma_xy = dot(v0, v1);
-    float sigma_yy = dot(v1, v1) + 0.3;
+    float sigma_yy = dot(v1, v1) + filterDilation;
 
     // ============================================================
     // Phase 13: Compute 2D ellipse pixel radius from eigenvalues
@@ -194,4 +200,11 @@ void main() {
     // Phase 13: Write touched tile count
     uint touchedCount = (max_tx - min_tx) * (max_ty - min_ty);
     touchedTiles[idx] = touchedCount;
+
+    // Phase 19b: Atomically count visible Gaussians for HUD telemetry
+    // Write to tilePrefixSum[paddedCount] (= sortKeys.length()) to avoid
+    // altering the 15-binding descriptor layout.
+    if (touchedCount > 0u) {
+        atomicAdd(tilePrefixSum[sortKeys.length()], 1u);
+    }
 }

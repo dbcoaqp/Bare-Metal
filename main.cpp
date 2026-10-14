@@ -22,9 +22,20 @@
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
+// Dear ImGui (Phase 19b)
+#include "imgui.h"
+#include "imgui_impl_glfw.h"
+#include "imgui_impl_vulkan.h"
+
+#ifdef _WIN32
 #include <nvtx3/nvToolsExt.h>
 #ifdef MemoryBarrier
 #undef MemoryBarrier
+#endif
+#else
+// NVTX stubs for non-Windows (macOS/Linux)
+inline void nvtxRangePushA(const char*) {}
+inline void nvtxRangePop() {}
 #endif
 
 #include "utils/FileIO.h"
@@ -47,17 +58,19 @@ static bool keyForward = false;
 static bool keyBackward = false;
 static bool keyLeft = false;
 static bool keyRight = false;
+static bool uiMode = false;  // Phase 19b: false = Camera Mode, true = UI Mode
 
 static void cursorPosCallback(GLFWwindow* window, double xpos, double ypos) {
     (void)window;
-    pendingMouseX += static_cast<float>(xpos - lastMouseX);
-    pendingMouseY += static_cast<float>(lastMouseY - ypos);
+    if (!uiMode) {
+        pendingMouseX += static_cast<float>(xpos - lastMouseX);
+        pendingMouseY += static_cast<float>(lastMouseY - ypos);
+    }
     lastMouseX = xpos;
     lastMouseY = ypos;
 }
 
 static void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods) {
-    (void)window;
     (void)scancode;
     (void)mods;
     const bool pressed = action != GLFW_RELEASE;
@@ -65,6 +78,20 @@ static void keyCallback(GLFWwindow* window, int key, int scancode, int action, i
     if (key == GLFW_KEY_S) keyBackward = pressed;
     if (key == GLFW_KEY_A) keyLeft = pressed;
     if (key == GLFW_KEY_D) keyRight = pressed;
+
+    // Phase 19b: TAB toggles between Camera Mode and UI Mode
+    if (key == GLFW_KEY_TAB && action == GLFW_PRESS) {
+        uiMode = !uiMode;
+        if (uiMode) {
+            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+        } else {
+            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+            // Re-anchor mouse position to prevent camera snap
+            glfwGetCursorPos(window, &lastMouseX, &lastMouseY);
+            pendingMouseX = 0.0f;
+            pendingMouseY = 0.0f;
+        }
+    }
 }
 
 class GlfwGuard {
@@ -174,10 +201,11 @@ private:
             return {0, indices};
         }
 
-        // 2. Must support Compute Queue
+        // 2. Must support Compute AND Graphics Queue (Graphics needed for ImGui overlay)
         std::vector<vk::QueueFamilyProperties> queueFamilies = device.getQueueFamilyProperties();
         for (uint32_t i = 0; i < queueFamilies.size(); ++i) {
-            if (queueFamilies[i].queueFlags & vk::QueueFlagBits::eCompute) {
+            if ((queueFamilies[i].queueFlags & vk::QueueFlagBits::eCompute) &&
+                (queueFamilies[i].queueFlags & vk::QueueFlagBits::eGraphics)) {
                 indices.computeFamily = i;
                 break;
             }
@@ -459,7 +487,7 @@ int main() {
             chosenFormat.colorSpace,
             swapchainExtent,
             1,                                          // imageArrayLayers
-            vk::ImageUsageFlagBits::eTransferDst,       // Compute result copies TO this image
+            vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eColorAttachment,  // Phase 19b: ImGui needs ColorAttachment
             vk::SharingMode::eExclusive,
             0, nullptr,
             surfaceCapabilities.currentTransform,
@@ -474,6 +502,91 @@ int main() {
 
         auto swapchainImages = vulkanDevice.getDevice().getSwapchainImagesKHR(*swapchain);
         std::cout << "[System] Retrieved " << swapchainImages.size() << " swapchain images." << std::endl;
+
+        // ===== Phase 19b: Swapchain ImageViews (needed for ImGui framebuffers) =====
+        std::vector<vk::UniqueImageView> swapchainImageViews;
+        for (size_t i = 0; i < swapchainImages.size(); ++i) {
+            vk::ImageViewCreateInfo viewCreateInfo(
+                vk::ImageViewCreateFlags(),
+                swapchainImages[i],
+                vk::ImageViewType::e2D,
+                chosenFormat.format,
+                vk::ComponentMapping(),
+                vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1)
+            );
+            swapchainImageViews.push_back(vulkanDevice.getDevice().createImageViewUnique(viewCreateInfo));
+        }
+        std::cout << "[System] Created " << swapchainImageViews.size() << " swapchain image views." << std::endl;
+
+        // ===== Phase 19b: ImGui RenderPass =====
+        // loadOp = eLoad: MUST preserve the DMA-copied 3DGS image
+        // finalLayout = ePresentSrcKHR: auto-transition for presentation
+        vk::AttachmentDescription imguiAttachment(
+            vk::AttachmentDescriptionFlags(),
+            chosenFormat.format,
+            vk::SampleCountFlagBits::e1,
+            vk::AttachmentLoadOp::eLoad,       // Preserve compute-rasterized image
+            vk::AttachmentStoreOp::eStore,
+            vk::AttachmentLoadOp::eDontCare,   // stencil
+            vk::AttachmentStoreOp::eDontCare,  // stencil
+            vk::ImageLayout::eColorAttachmentOptimal,  // initialLayout
+            vk::ImageLayout::ePresentSrcKHR            // finalLayout (auto-transition)
+        );
+
+        vk::AttachmentReference colorRef(0, vk::ImageLayout::eColorAttachmentOptimal);
+        vk::SubpassDescription subpass(
+            vk::SubpassDescriptionFlags(),
+            vk::PipelineBindPoint::eGraphics,
+            0, nullptr,       // input attachments
+            1, &colorRef,     // color attachments
+            nullptr,          // resolve
+            nullptr,          // depth
+            0, nullptr        // preserve
+        );
+
+        vk::SubpassDependency imguiDep(
+            VK_SUBPASS_EXTERNAL, 0,
+            vk::PipelineStageFlagBits::eTransfer,
+            vk::PipelineStageFlagBits::eColorAttachmentOutput,
+            vk::AccessFlagBits::eTransferWrite,
+            vk::AccessFlagBits::eColorAttachmentRead | vk::AccessFlagBits::eColorAttachmentWrite,
+            vk::DependencyFlags()
+        );
+
+        vk::RenderPassCreateInfo imguiRenderPassCI(
+            vk::RenderPassCreateFlags(),
+            1, &imguiAttachment,
+            1, &subpass,
+            1, &imguiDep
+        );
+
+        auto imguiRenderPass = vulkanDevice.getDevice().createRenderPassUnique(imguiRenderPassCI);
+        std::cout << "[System] ImGui RenderPass created." << std::endl;
+
+        // ===== Phase 19b: ImGui Framebuffers (one per swapchain image) =====
+        std::vector<vk::UniqueFramebuffer> imguiFramebuffers;
+        for (size_t i = 0; i < swapchainImageViews.size(); ++i) {
+            vk::ImageView attachments[] = { *swapchainImageViews[i] };
+            vk::FramebufferCreateInfo fbCI(
+                vk::FramebufferCreateFlags(),
+                *imguiRenderPass,
+                1, attachments,
+                WIDTH, HEIGHT, 1
+            );
+            imguiFramebuffers.push_back(vulkanDevice.getDevice().createFramebufferUnique(fbCI));
+        }
+        std::cout << "[System] Created " << imguiFramebuffers.size() << " ImGui framebuffers." << std::endl;
+
+        // ===== Phase 19b: ImGui Descriptor Pool =====
+        vk::DescriptorPoolSize imguiPoolSizes[] = {
+            { vk::DescriptorType::eCombinedImageSampler, 1 }
+        };
+        vk::DescriptorPoolCreateInfo imguiPoolCI(
+            vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
+            1,
+            1, imguiPoolSizes
+        );
+        auto imguiDescriptorPool = vulkanDevice.getDevice().createDescriptorPoolUnique(imguiPoolCI);
 
         // ===== Compute Pipeline Setup =====
 
@@ -586,8 +699,8 @@ int main() {
         cameraData.tan_fovy = 0.5f;
         cameraData.viewport[0] = static_cast<float>(WIDTH);
         cameraData.viewport[1] = static_cast<float>(HEIGHT);
-        cameraData.pad_cam[0] = 0.0f;
-        cameraData.pad_cam[1] = 0.0f;
+        cameraData.filterDilation = 0.3f;  // Phase 19b: default low-pass filter
+        cameraData.scaleModifier = 1.0f;   // Phase 19b: default scale multiplier
 
         VmaBuffer cameraBuffer(
             vulkanDevice.getAllocator(),
@@ -1221,6 +1334,59 @@ int main() {
         std::cout << "[System] " << MAX_FRAMES_IN_FLIGHT << " sets of Synchronization traffic lights created." << std::endl;
 
         std::cout << "[System] Entering render loop..." << std::endl;
+
+        // ===== Phase 19b: Initialize Dear ImGui =====
+        IMGUI_CHECKVERSION();
+        ImGui::CreateContext();
+        ImGuiIO& io = ImGui::GetIO();
+        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+        ImGui::StyleColorsDark();
+
+        ImGui_ImplGlfw_InitForVulkan(window.get(), true);
+
+        ImGui_ImplVulkan_InitInfo imguiInitInfo = {};
+        imguiInitInfo.Instance = static_cast<VkInstance>(vkInstance.get());
+        imguiInitInfo.PhysicalDevice = static_cast<VkPhysicalDevice>(target.physical);
+        imguiInitInfo.Device = static_cast<VkDevice>(vulkanDevice.getDevice());
+        imguiInitInfo.QueueFamily = target.indices.computeFamily.value();
+        imguiInitInfo.Queue = static_cast<VkQueue>(vulkanDevice.getComputeQueue());
+        imguiInitInfo.PipelineCache = VK_NULL_HANDLE;
+        imguiInitInfo.DescriptorPool = static_cast<VkDescriptorPool>(*imguiDescriptorPool);
+        imguiInitInfo.Subpass = 0;
+        imguiInitInfo.MinImageCount = minImageCount;
+        imguiInitInfo.ImageCount = static_cast<uint32_t>(swapchainImages.size());
+        imguiInitInfo.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+        imguiInitInfo.RenderPass = static_cast<VkRenderPass>(*imguiRenderPass);
+
+        ImGui_ImplVulkan_Init(&imguiInitInfo);
+
+        // Upload ImGui fonts
+        {
+            auto fontCmdBufs = vulkanDevice.getDevice().allocateCommandBuffersUnique(
+                vk::CommandBufferAllocateInfo(*commandPool, vk::CommandBufferLevel::ePrimary, 1));
+            fontCmdBufs[0]->begin(vk::CommandBufferBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit));
+            ImGui_ImplVulkan_CreateFontsTexture();
+            fontCmdBufs[0]->end();
+            vk::SubmitInfo fontSubmit(0, nullptr, nullptr, 1, &*fontCmdBufs[0], 0, nullptr);
+            VK_CHECK(vulkanDevice.getComputeQueue().submit(1, &fontSubmit, nullptr));
+            vulkanDevice.getComputeQueue().waitIdle();
+        }
+        std::cout << "[System] Dear ImGui initialized with Vulkan + GLFW backend." << std::endl;
+
+        // ===== Phase 19b: Visible count readback buffer (4 bytes, persistently mapped) =====
+        VmaBuffer visibleCountReadbackBuffer(
+            vulkanDevice.getAllocator(),
+            sizeof(uint32_t),
+            vk::BufferUsageFlagBits::eTransferDst,
+            VMA_MEMORY_USAGE_GPU_TO_CPU
+        );
+        uint32_t* mappedVisibleCount = static_cast<uint32_t*>(visibleCountReadbackBuffer.map());
+        *mappedVisibleCount = 0;
+        uint32_t lastVisibleCount = 0;
+
+        // Phase 19b: HUD slider variables (host-side, written to UBO each frame)
+        float filterDilation = 0.3f;
+        float scaleModifier = 1.0f;
 
         // ===== Phase 10: The Async Hot Loop (Radix Sort) =====
         auto previousFrameTime = std::chrono::steady_clock::now();

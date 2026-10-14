@@ -55,7 +55,8 @@ struct alignas(16) CameraUniform {
     float tan_fovx;
     float tan_fovy;
     float viewport[2];
-    float pad_cam[2];
+    float filterDilation; // default 0.3f (low-pass covariance filter)
+    float scaleModifier;  // default 1.0f (global Gaussian scale multiplier)
 };
 
 static_assert(sizeof(CameraUniform) == 128, "CameraUniform must be exactly 128 bytes");
