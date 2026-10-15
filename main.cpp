@@ -687,16 +687,21 @@ int main() {
         cameraData.cameraForward[2] = initialForward.z;
         cameraData.cameraForward[3] = 0.0f;
 
-        const glm::mat4 initialProjection = glm::perspectiveRH_ZO(glm::radians(57.29578f),
-            static_cast<float>(WIDTH) / static_cast<float>(HEIGHT), 0.1f, 100.0f);
+        const float fovY = glm::radians(57.29578f);
+        const float aspect = static_cast<float>(WIDTH) / static_cast<float>(HEIGHT);
+        const glm::mat4 initialProjection = glm::perspectiveRH_ZO(fovY, aspect, 0.1f, 100.0f);
         glm::mat4 initialViewProj = initialProjection * camera.getViewMatrix();
         initialViewProj[1][1] *= -1.0f;
         std::memcpy(cameraData.viewProj, &initialViewProj, sizeof(cameraData.viewProj));
 
-        cameraData.focal_x = 1000.0f;
-        cameraData.focal_y = 1000.0f;
-        cameraData.tan_fovx = 0.5f;
-        cameraData.tan_fovy = 0.5f;
+        // Derive focal length and tan(half-fov) from the actual FOV — NEVER hardcode!
+        // fovY = 57.29578° ≈ 1.0 rad  →  tan(0.5) ≈ 0.5463  →  focal_y ≈ HEIGHT / (2 * tan(fovY/2))
+        const float tanHalfFovY = std::tan(fovY * 0.5f);
+        const float tanHalfFovX = tanHalfFovY * aspect;
+        cameraData.focal_y = static_cast<float>(HEIGHT) / (2.0f * tanHalfFovY);
+        cameraData.focal_x = static_cast<float>(WIDTH)  / (2.0f * tanHalfFovX);
+        cameraData.tan_fovx = tanHalfFovX;
+        cameraData.tan_fovy = tanHalfFovY;
         cameraData.viewport[0] = static_cast<float>(WIDTH);
         cameraData.viewport[1] = static_cast<float>(HEIGHT);
         cameraData.filterDilation = 0.3f;  // Phase 19b: default low-pass filter
@@ -912,15 +917,16 @@ int main() {
 
         auto descriptorSetLayout = vulkanDevice.getDevice().createDescriptorSetLayoutUnique(layoutCreateInfo);
 
-        // 10. Descriptor pool (5 descriptor sets: mainDS + swapDS + tileMainDS + tileSwapDS + tilePtrDS, 15 bindings each)
+        // 10. Descriptor pool (3 descriptor sets: mainDS + swapDS + tileSwapDS, 15 bindings each)
+        // (tileMainDS and tilePtrDS were byte-identical clones of mainDS — eliminated)
         std::vector<vk::DescriptorPoolSize> poolSizes = {
-            vk::DescriptorPoolSize(vk::DescriptorType::eStorageBuffer, 75),  // 15 storage buffers x 5 sets
-            vk::DescriptorPoolSize(vk::DescriptorType::eUniformBuffer, 5)    // 1 uniform buffer x 5 sets
+            vk::DescriptorPoolSize(vk::DescriptorType::eStorageBuffer, 45),  // 15 storage buffers x 3 sets
+            vk::DescriptorPoolSize(vk::DescriptorType::eUniformBuffer, 3)    // 1 uniform buffer x 3 sets
         };
 
         vk::DescriptorPoolCreateInfo poolCreateInfo(
             vk::DescriptorPoolCreateFlags(),
-            5,  // maxSets: mainDS + swapDS + tileMainDS + tileSwapDS + tilePtrDS
+            3,  // maxSets: mainDS + swapDS + tileSwapDS
             static_cast<uint32_t>(poolSizes.size()),
             poolSizes.data()
         );
@@ -1311,7 +1317,9 @@ int main() {
         updateAllDescriptorSets();
 
         // 14. Command buffer
-        const uint32_t MAX_FRAMES_IN_FLIGHT = static_cast<uint32_t>(swapchainImages.size());
+        // MAX_FRAMES_IN_FLIGHT = 1 for now: single shared cameraBuffer means multi-frame
+        // pipelining creates a UBO write-while-read hazard. TODO: per-frame camera buffers.
+        const uint32_t MAX_FRAMES_IN_FLIGHT = 1;
         vk::CommandBufferAllocateInfo commandBufferAllocateInfo(*commandPool, vk::CommandBufferLevel::ePrimary, MAX_FRAMES_IN_FLIGHT);
         auto commandBuffers = vulkanDevice.getDevice().allocateCommandBuffersUnique(commandBufferAllocateInfo);
 
@@ -1405,10 +1413,6 @@ int main() {
                 0.0f,
                 static_cast<float>(keyForward) - static_cast<float>(keyBackward));
             camera.processKeyboard(movement, deltaTime);
-
-            // The descriptor sets share one mapped UBO, so finish all earlier GPU reads
-            // before overwriting it with this frame's camera state.
-            VK_CHECK(vulkanDevice.getDevice().waitIdle());
 
             // Wait for the specific frame's GPU work to complete
             VK_CHECK(vulkanDevice.getDevice().waitForFences(*renderFences[currentFrame], VK_TRUE, UINT64_MAX));
@@ -1550,12 +1554,7 @@ int main() {
             // ====== Stage C: Covariance Preprocess ======
             nvtxRangePushA("3. Covariance Preprocess");
 
-            vk::MemoryBarrier preprocessBarrier(
-                vk::AccessFlagBits::eShaderWrite,
-                vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite);
-            commandBuffer->pipelineBarrier(
-                vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eComputeShader,
-                vk::DependencyFlags(), 1, &preprocessBarrier, 0, nullptr, 0, nullptr);
+            // (Barrier already issued by last scatterBarrier in Stage B — no redundant double-barrier)
 
             commandBuffer->bindPipeline(vk::PipelineBindPoint::eCompute, *preprocessPipeline);
             uint32_t preprocessGroupCountX = (paddedCount + 255) / 256;
@@ -1670,12 +1669,7 @@ int main() {
             // ====== Stage F.5: Tile Pointers Extraction ======
             nvtxRangePushA("6.5 Tile Pointers Extraction");
 
-            vk::MemoryBarrier tileSortToPtrBarrier(
-                vk::AccessFlagBits::eShaderWrite,
-                vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite);
-            commandBuffer->pipelineBarrier(
-                vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eComputeShader,
-                vk::DependencyFlags(), 1, &tileSortToPtrBarrier, 0, nullptr, 0, nullptr);
+            // (Barrier already issued by last tileScatterBarrier in Stage F — no redundant double-barrier)
 
             commandBuffer->bindPipeline(vk::PipelineBindPoint::eCompute, *tilePointersPipeline);
             commandBuffer->bindDescriptorSets(
@@ -1698,12 +1692,7 @@ int main() {
             // ====== Stage G: Compute Rasterization ======
             nvtxRangePushA("7. Compute Rasterization");
 
-            vk::MemoryBarrier rasterizeBarrier(
-                vk::AccessFlagBits::eShaderWrite,
-                vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite);
-            commandBuffer->pipelineBarrier(
-                vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eComputeShader,
-                vk::DependencyFlags(), 1, &rasterizeBarrier, 0, nullptr, 0, nullptr);
+            // (Barrier already issued by tilePtrBarrier in Stage F.5 — no redundant double-barrier)
 
             commandBuffer->bindPipeline(vk::PipelineBindPoint::eCompute, *rasterizePipeline);
             commandBuffer->bindDescriptorSets(
