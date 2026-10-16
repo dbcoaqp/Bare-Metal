@@ -60,6 +60,10 @@ public:
         VK_CHECK(vmaFlushAllocation(m_allocator, m_allocation, 0, static_cast<VkDeviceSize>(size)));
     }
 
+    void invalidate(vk::DeviceSize size = VK_WHOLE_SIZE) {
+        VK_CHECK(vmaInvalidateAllocation(m_allocator, m_allocation, 0, static_cast<VkDeviceSize>(size)));
+    }
+
 private:
     VmaAllocator m_allocator;
     vk::Buffer m_buffer;

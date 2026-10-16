@@ -205,7 +205,8 @@ private:
         std::vector<vk::QueueFamilyProperties> queueFamilies = device.getQueueFamilyProperties();
         for (uint32_t i = 0; i < queueFamilies.size(); ++i) {
             if ((queueFamilies[i].queueFlags & vk::QueueFlagBits::eCompute) &&
-                (queueFamilies[i].queueFlags & vk::QueueFlagBits::eGraphics)) {
+                (queueFamilies[i].queueFlags & vk::QueueFlagBits::eGraphics) &&
+                queueFamilies[i].timestampValidBits > 0) {
                 indices.computeFamily = i;
                 break;
             }
@@ -431,6 +432,12 @@ int main() {
         VulkanDevice vulkanDevice(vkInstance.get(), target);
         std::cout << "[System] Logical Device and Compute Queue successfully engaged." << std::endl;
         std::cout << "[System] VMA Allocator successfully engaged." << std::endl;
+        constexpr uint32_t TIMESTAMP_COUNT = 8;
+        const float timestampPeriod = target.physical.getProperties().limits.timestampPeriod;
+        const uint32_t timestampValidBits = target.physical.getQueueFamilyProperties()
+            [target.indices.computeFamily.value()].timestampValidBits;
+        auto timestampQueryPool = vulkanDevice.getDevice().createQueryPoolUnique(
+            vk::QueryPoolCreateInfo({}, vk::QueryType::eTimestamp, TIMESTAMP_COUNT));
         std::cout << "--- Bare Metal Boot Sequence Completed ---" << std::endl;
 
         // ===== Phase 9: Build Swapchain =====
@@ -1191,23 +1198,14 @@ int main() {
         auto tilePointersPipeline = std::move(tilePointersPipelineResult.value);
         std::cout << "[System] Tile pointers pipeline created." << std::endl;
 
-        // 13. Descriptor sets (5 sets: mainDS + swapDS + tileMainDS + tileSwapDS + tilePtrDS)
-        std::vector<vk::DescriptorSetLayout> setLayouts = {*descriptorSetLayout, *descriptorSetLayout};
+        // 13. Descriptor sets (3 sets: mainDS + swapDS + tileSwapDS)
+        std::vector<vk::DescriptorSetLayout> setLayouts = {
+            *descriptorSetLayout, *descriptorSetLayout, *descriptorSetLayout};
         vk::DescriptorSetAllocateInfo descriptorSetAllocateInfo(*descriptorPool, static_cast<uint32_t>(setLayouts.size()), setLayouts.data());
         auto descriptorSets = vulkanDevice.getDevice().allocateDescriptorSets(descriptorSetAllocateInfo);
         auto mainDS = descriptorSets[0];
         auto swapDS = descriptorSets[1];
-
-        std::vector<vk::DescriptorSetLayout> tileSetLayouts = {*descriptorSetLayout, *descriptorSetLayout};
-        vk::DescriptorSetAllocateInfo tileDSAllocateInfo(*descriptorPool, static_cast<uint32_t>(tileSetLayouts.size()), tileSetLayouts.data());
-        auto tileDescriptorSets = vulkanDevice.getDevice().allocateDescriptorSets(tileDSAllocateInfo);
-        auto tileMainDS = tileDescriptorSets[0];
-        auto tileSwapDS = tileDescriptorSets[1];
-
-        std::vector<vk::DescriptorSetLayout> tilePtrSetLayouts = {*descriptorSetLayout};
-        vk::DescriptorSetAllocateInfo tilePtrDSAllocateInfo(*descriptorPool, static_cast<uint32_t>(tilePtrSetLayouts.size()), tilePtrSetLayouts.data());
-        auto tilePtrDescriptorSets = vulkanDevice.getDevice().allocateDescriptorSets(tilePtrDSAllocateInfo);
-        auto tilePtrDS = tilePtrDescriptorSets[0];
+        auto tileSwapDS = descriptorSets[2];
 
         // Helper lambda to update all descriptor sets
         auto updateAllDescriptorSets = [&]() {
@@ -1260,22 +1258,6 @@ int main() {
                 vk::WriteDescriptorSet(swapDS, 12, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tileHistogramBufferInfo, nullptr),
                 vk::WriteDescriptorSet(swapDS, 13, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tileGlobalOffsetBufferInfo, nullptr),
                 vk::WriteDescriptorSet(swapDS, 14, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tilePointersBufferInfo, nullptr),
-                // tileMainDS: 64-bit tile radix ping-pong (binding 10=src, binding 11=dst)
-                vk::WriteDescriptorSet(tileMainDS, 0, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &gaussianBufferInfo, nullptr),
-                vk::WriteDescriptorSet(tileMainDS, 1, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &sortKeyBufferInfo, nullptr),
-                vk::WriteDescriptorSet(tileMainDS, 2, 0, 1, vk::DescriptorType::eUniformBuffer, nullptr, &cameraBufferInfo, nullptr),
-                vk::WriteDescriptorSet(tileMainDS, 3, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &gaussian2DBufferInfo, nullptr),
-                vk::WriteDescriptorSet(tileMainDS, 4, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &imageBufferInfo, nullptr),
-                vk::WriteDescriptorSet(tileMainDS, 5, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &sortKeyBufferAltInfo, nullptr),
-                vk::WriteDescriptorSet(tileMainDS, 6, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &histogramBufferInfo, nullptr),
-                vk::WriteDescriptorSet(tileMainDS, 7, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &globalOffsetBufferInfo, nullptr),
-                vk::WriteDescriptorSet(tileMainDS, 8, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &touchedTilesBufferInfo, nullptr),
-                vk::WriteDescriptorSet(tileMainDS, 9, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tilePrefixSumBufferInfo, nullptr),
-                vk::WriteDescriptorSet(tileMainDS, 10, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tileSortKeyBufferInfo, nullptr),
-                vk::WriteDescriptorSet(tileMainDS, 11, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tileSortKeyBufferAltInfo, nullptr),
-                vk::WriteDescriptorSet(tileMainDS, 12, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tileHistogramBufferInfo, nullptr),
-                vk::WriteDescriptorSet(tileMainDS, 13, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tileGlobalOffsetBufferInfo, nullptr),
-                vk::WriteDescriptorSet(tileMainDS, 14, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tilePointersBufferInfo, nullptr),
                 // tileSwapDS: 64-bit tile radix ping-pong (binding 10=dst, binding 11=src — SWAPPED)
                 vk::WriteDescriptorSet(tileSwapDS, 0, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &gaussianBufferInfo, nullptr),
                 vk::WriteDescriptorSet(tileSwapDS, 1, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &sortKeyBufferInfo, nullptr),
@@ -1292,22 +1274,6 @@ int main() {
                 vk::WriteDescriptorSet(tileSwapDS, 12, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tileHistogramBufferInfo, nullptr),
                 vk::WriteDescriptorSet(tileSwapDS, 13, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tileGlobalOffsetBufferInfo, nullptr),
                 vk::WriteDescriptorSet(tileSwapDS, 14, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tilePointersBufferInfo, nullptr),
-                // tilePtrDS: tile pointers (same layout as mainDS, binding 14 is key)
-                vk::WriteDescriptorSet(tilePtrDS, 0, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &gaussianBufferInfo, nullptr),
-                vk::WriteDescriptorSet(tilePtrDS, 1, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &sortKeyBufferInfo, nullptr),
-                vk::WriteDescriptorSet(tilePtrDS, 2, 0, 1, vk::DescriptorType::eUniformBuffer, nullptr, &cameraBufferInfo, nullptr),
-                vk::WriteDescriptorSet(tilePtrDS, 3, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &gaussian2DBufferInfo, nullptr),
-                vk::WriteDescriptorSet(tilePtrDS, 4, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &imageBufferInfo, nullptr),
-                vk::WriteDescriptorSet(tilePtrDS, 5, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &sortKeyBufferAltInfo, nullptr),
-                vk::WriteDescriptorSet(tilePtrDS, 6, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &histogramBufferInfo, nullptr),
-                vk::WriteDescriptorSet(tilePtrDS, 7, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &globalOffsetBufferInfo, nullptr),
-                vk::WriteDescriptorSet(tilePtrDS, 8, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &touchedTilesBufferInfo, nullptr),
-                vk::WriteDescriptorSet(tilePtrDS, 9, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tilePrefixSumBufferInfo, nullptr),
-                vk::WriteDescriptorSet(tilePtrDS, 10, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tileSortKeyBufferInfo, nullptr),
-                vk::WriteDescriptorSet(tilePtrDS, 11, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tileSortKeyBufferAltInfo, nullptr),
-                vk::WriteDescriptorSet(tilePtrDS, 12, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tileHistogramBufferInfo, nullptr),
-                vk::WriteDescriptorSet(tilePtrDS, 13, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tileGlobalOffsetBufferInfo, nullptr),
-                vk::WriteDescriptorSet(tilePtrDS, 14, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &tilePointersBufferInfo, nullptr),
             };
 
             vulkanDevice.getDevice().updateDescriptorSets(
@@ -1317,8 +1283,7 @@ int main() {
         updateAllDescriptorSets();
 
         // 14. Command buffer
-        // MAX_FRAMES_IN_FLIGHT = 1 for now: single shared cameraBuffer means multi-frame
-        // pipelining creates a UBO write-while-read hazard. TODO: per-frame camera buffers.
+        // A single frame in flight protects the shared camera UBO and timestamp query pool.
         const uint32_t MAX_FRAMES_IN_FLIGHT = 1;
         vk::CommandBufferAllocateInfo commandBufferAllocateInfo(*commandPool, vk::CommandBufferLevel::ePrimary, MAX_FRAMES_IN_FLIGHT);
         auto commandBuffers = vulkanDevice.getDevice().allocateCommandBuffersUnique(commandBufferAllocateInfo);
@@ -1391,6 +1356,9 @@ int main() {
         uint32_t* mappedVisibleCount = static_cast<uint32_t*>(visibleCountReadbackBuffer.map());
         *mappedVisibleCount = 0;
         uint32_t lastVisibleCount = 0;
+        double stageTimesMs[7] = {};
+        double totalGpuTimeMs = 0.0;
+        bool isFirstFrame = true;
 
         // Phase 19b: HUD slider variables (host-side, written to UBO each frame)
         float filterDilation = 0.3f;
@@ -1409,14 +1377,104 @@ int main() {
             pendingMouseX = 0.0f;
             pendingMouseY = 0.0f;
             const glm::vec3 movement(
-                static_cast<float>(keyRight) - static_cast<float>(keyLeft),
+                uiMode ? 0.0f : static_cast<float>(keyRight) - static_cast<float>(keyLeft),
                 0.0f,
-                static_cast<float>(keyForward) - static_cast<float>(keyBackward));
+                uiMode ? 0.0f : static_cast<float>(keyForward) - static_cast<float>(keyBackward));
             camera.processKeyboard(movement, deltaTime);
 
             // Wait for the specific frame's GPU work to complete
             VK_CHECK(vulkanDevice.getDevice().waitForFences(*renderFences[currentFrame], VK_TRUE, UINT64_MAX));
             vulkanDevice.getDevice().resetFences(*renderFences[currentFrame]);
+
+            if (!isFirstFrame) {
+                visibleCountReadbackBuffer.invalidate();
+                lastVisibleCount = *mappedVisibleCount;
+
+                uint64_t timestamps[TIMESTAMP_COUNT] = {};
+                const vk::Result queryResult = vulkanDevice.getDevice().getQueryPoolResults(
+                    *timestampQueryPool, 0, TIMESTAMP_COUNT,
+                    sizeof(timestamps), timestamps, sizeof(uint64_t), vk::QueryResultFlagBits::e64);
+                if (queryResult == vk::Result::eSuccess) {
+                    const uint64_t validMask = timestampValidBits >= 64
+                        ? UINT64_MAX
+                        : ((uint64_t{1} << timestampValidBits) - 1);
+                    for (uint32_t stage = 0; stage < 7; ++stage) {
+                        const uint64_t elapsedTicks = (timestamps[stage + 1] - timestamps[stage]) & validMask;
+                        stageTimesMs[stage] = static_cast<double>(elapsedTicks) * timestampPeriod / 1.0e6;
+                    }
+                    const uint64_t totalTicks = (timestamps[7] - timestamps[0]) & validMask;
+                    totalGpuTimeMs = static_cast<double>(totalTicks) * timestampPeriod / 1.0e6;
+                }
+            }
+
+            ImGui_ImplVulkan_NewFrame();
+            ImGui_ImplGlfw_NewFrame();
+            ImGui::NewFrame();
+
+            ImGui::SetNextWindowPos(ImVec2(12.0f, 12.0f), ImGuiCond_Always);
+            ImGui::SetNextWindowBgAlpha(0.82f);
+            ImGui::Begin("Bare-Metal 3DGS Telemetry [Phase 20]", nullptr,
+                ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse);
+            ImGui::Text("Mode: %s  [TAB] Toggle UI / Camera Mode", uiMode ? "UI" : "Camera");
+            const float safeDeltaTime = std::max(deltaTime, 1.0e-6f);
+            ImGui::Text("CPU Frame: %.3f ms  |  FPS: %.1f", deltaTime * 1000.0f, 1.0f / safeDeltaTime);
+
+            VmaBudget budgets[VK_MAX_MEMORY_HEAPS] = {};
+            vmaGetHeapBudgets(vulkanDevice.getAllocator(), budgets);
+            const vk::PhysicalDeviceMemoryProperties memoryProperties = target.physical.getMemoryProperties();
+            vk::DeviceSize deviceLocalUsage = 0;
+            vk::DeviceSize deviceLocalBudget = 0;
+            for (uint32_t heap = 0; heap < memoryProperties.memoryHeapCount; ++heap) {
+                if (memoryProperties.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+                    deviceLocalUsage += budgets[heap].usage;
+                    deviceLocalBudget += budgets[heap].budget;
+                }
+            }
+            const float vramFraction = deviceLocalBudget > 0
+                ? std::clamp(static_cast<float>(deviceLocalUsage) / static_cast<float>(deviceLocalBudget), 0.0f, 1.0f)
+                : 0.0f;
+            constexpr double BYTES_PER_MEGABYTE = 1024.0 * 1024.0;
+            ImGui::Text("VRAM: %.2f MB / %.2f MB",
+                static_cast<double>(deviceLocalUsage) / BYTES_PER_MEGABYTE,
+                static_cast<double>(deviceLocalBudget) / BYTES_PER_MEGABYTE);
+            ImGui::ProgressBar(vramFraction, ImVec2(280.0f, 0.0f));
+
+            const uint32_t totalGaussianCount = static_cast<uint32_t>(pointData.size());
+            const uint32_t culledCount = totalGaussianCount > lastVisibleCount
+                ? totalGaussianCount - lastVisibleCount
+                : 0;
+            const float cullingEfficiency = totalGaussianCount > 0
+                ? static_cast<float>(culledCount) / static_cast<float>(totalGaussianCount)
+                : 0.0f;
+            ImGui::Separator();
+            ImGui::Text("Frustum Culling: Total %u  |  Visible %u  |  Culled %u (%.1f%%)",
+                totalGaussianCount, lastVisibleCount, culledCount, cullingEfficiency * 100.0f);
+
+            static constexpr const char* GPU_STAGE_NAMES[7] = {
+                "Stage A (Pad + Depth)",
+                "Stage B (32b Radix Sort)",
+                "Stage C (Preprocess + Cov2D)",
+                "Stage E (Tile Duplicate)",
+                "Stage F (64b Tile Radix Sort)",
+                "Stage F.5 (Tile Pointers)",
+                "Stage G (Rasterize + Copy)"
+            };
+            ImGui::Separator();
+            ImGui::Text("Phase 20 GPU Hardware Timestamps: %.3f ms", totalGpuTimeMs);
+            for (uint32_t stage = 0; stage < 7; ++stage) {
+                ImGui::Text("%s: %.3f ms", GPU_STAGE_NAMES[stage], stageTimesMs[stage]);
+                const float stageFraction = totalGpuTimeMs > 0.0
+                    ? static_cast<float>(stageTimesMs[stage] / totalGpuTimeMs)
+                    : 0.0f;
+                ImGui::ProgressBar(std::clamp(stageFraction, 0.0f, 1.0f), ImVec2(280.0f, 0.0f));
+            }
+
+            ImGui::Separator();
+            ImGui::TextUnformatted("Kernel Sliders");
+            ImGui::SliderFloat("Low-Pass Filter (+eps)", &filterDilation, 0.0f, 5.0f, "%.3f");
+            ImGui::SliderFloat("Scale Modifier", &scaleModifier, 0.1f, 3.0f, "%.2f");
+            ImGui::End();
+            ImGui::Render();
 
             const glm::vec3 forward = camera.getForward();
             mappedCameraData->cameraPosition[0] = camera.position.x;
@@ -1431,6 +1489,8 @@ int main() {
             glm::mat4 viewProj = initialProjection * camera.getViewMatrix();
             viewProj[1][1] *= -1.0f;
             std::memcpy(mappedCameraData->viewProj, &viewProj, sizeof(mappedCameraData->viewProj));
+            mappedCameraData->filterDilation = filterDilation;
+            mappedCameraData->scaleModifier = scaleModifier;
             cameraBuffer.flush();
             
             uint32_t imageIndex;
@@ -1453,6 +1513,9 @@ int main() {
             commandBuffer->reset(vk::CommandBufferResetFlags());
             vk::CommandBufferBeginInfo beginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
             commandBuffer->begin(beginInfo);
+
+            commandBuffer->resetQueryPool(*timestampQueryPool, 0, TIMESTAMP_COUNT);
+            commandBuffer->writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *timestampQueryPool, 0);
 
             // ====== Stage A: Buffer Pad & Depth Calc ======
             nvtxRangePushA("1. Buffer Pad & Depth Calc");
@@ -1488,6 +1551,8 @@ int main() {
             commandBuffer->pipelineBarrier(
                 vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eComputeShader,
                 vk::DependencyFlags(), 1, &depthBarrier, 0, nullptr, 0, nullptr);
+
+            commandBuffer->writeTimestamp(vk::PipelineStageFlagBits::eComputeShader, *timestampQueryPool, 1);
 
             nvtxRangePop();
 
@@ -1545,6 +1610,8 @@ int main() {
                     vk::DependencyFlags(), 1, &scatterBarrier, 0, nullptr, 0, nullptr);
             }
 
+            commandBuffer->writeTimestamp(vk::PipelineStageFlagBits::eComputeShader, *timestampQueryPool, 2);
+
             // Rebind mainDS for downstream shaders (sorted data is in sortKeyBuffer after 4 passes)
             commandBuffer->bindDescriptorSets(
                 vk::PipelineBindPoint::eCompute, *pipelineLayout, 0, 1, &mainDS, 0, nullptr);
@@ -1554,11 +1621,18 @@ int main() {
             // ====== Stage C: Covariance Preprocess ======
             nvtxRangePushA("3. Covariance Preprocess");
 
-            // (Barrier already issued by last scatterBarrier in Stage B — no redundant double-barrier)
-
             commandBuffer->bindPipeline(vk::PipelineBindPoint::eCompute, *preprocessPipeline);
             uint32_t preprocessGroupCountX = (paddedCount + 255) / 256;
             commandBuffer->dispatch(preprocessGroupCountX, 1, 1);
+
+            vk::MemoryBarrier preprocessBarrier(
+                vk::AccessFlagBits::eShaderWrite,
+                vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite);
+            commandBuffer->pipelineBarrier(
+                vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eComputeShader,
+                vk::DependencyFlags(), 1, &preprocessBarrier, 0, nullptr, 0, nullptr);
+
+            commandBuffer->writeTimestamp(vk::PipelineStageFlagBits::eComputeShader, *timestampQueryPool, 3);
 
             nvtxRangePop();
             /*
@@ -1604,6 +1678,8 @@ int main() {
                 vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eComputeShader,
                 vk::DependencyFlags(), 1, &tileDupBarrier, 0, nullptr, 0, nullptr);
 
+            commandBuffer->writeTimestamp(vk::PipelineStageFlagBits::eComputeShader, *timestampQueryPool, 4);
+
             nvtxRangePop();
 
             // ====== Stage F: 64-bit Tile Radix Sort ======
@@ -1616,7 +1692,7 @@ int main() {
             for (uint32_t pass = 0; pass < 8; pass++) {
                 uint32_t shift = pass * 8;
                 bool isEvenPass = (pass % 2 == 0);
-                vk::DescriptorSet currentTileDS = isEvenPass ? tileMainDS : tileSwapDS;
+                vk::DescriptorSet currentTileDS = isEvenPass ? mainDS : tileSwapDS;
 
                 commandBuffer->bindDescriptorSets(
                     vk::PipelineBindPoint::eCompute, *pipelineLayout, 0, 1, &currentTileDS, 0, nullptr);
@@ -1664,6 +1740,8 @@ int main() {
                     vk::DependencyFlags(), 1, &tileScatterBarrier, 0, nullptr, 0, nullptr);
             }
 
+            commandBuffer->writeTimestamp(vk::PipelineStageFlagBits::eComputeShader, *timestampQueryPool, 5);
+
             nvtxRangePop();
 
             // ====== Stage F.5: Tile Pointers Extraction ======
@@ -1673,7 +1751,7 @@ int main() {
 
             commandBuffer->bindPipeline(vk::PipelineBindPoint::eCompute, *tilePointersPipeline);
             commandBuffer->bindDescriptorSets(
-                vk::PipelineBindPoint::eCompute, *pipelineLayout, 0, 1, &tilePtrDS, 0, nullptr);
+                vk::PipelineBindPoint::eCompute, *pipelineLayout, 0, 1, &mainDS, 0, nullptr);
             uint32_t tilePtrPC[3] = {paddedCount, 0, 0};
             commandBuffer->pushConstants<uint32_t>(
                 *pipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, tilePtrPC);
@@ -1686,6 +1764,8 @@ int main() {
             commandBuffer->pipelineBarrier(
                 vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eComputeShader,
                 vk::DependencyFlags(), 1, &tilePtrBarrier, 0, nullptr, 0, nullptr);
+
+            commandBuffer->writeTimestamp(vk::PipelineStageFlagBits::eComputeShader, *timestampQueryPool, 6);
 
             nvtxRangePop();
 
@@ -1739,18 +1819,42 @@ int main() {
                 vk::ImageLayout::eTransferDstOptimal,
                 bufferImageCopy);
 
-            vk::ImageMemoryBarrier toPresentSrc(
+            commandBuffer->writeTimestamp(vk::PipelineStageFlagBits::eTransfer, *timestampQueryPool, 7);
+
+            // Defer telemetry readback until the transfer stage so the compute stages stay contiguous.
+            const vk::BufferCopy visibleCountCopy(
+                static_cast<vk::DeviceSize>(paddedCount) * sizeof(uint32_t), 0, sizeof(uint32_t));
+            commandBuffer->copyBuffer(
+                tilePrefixSumBuffer.getBuffer(), visibleCountReadbackBuffer.getBuffer(), visibleCountCopy);
+            vk::BufferMemoryBarrier visibleCountHostBarrier(
+                vk::AccessFlagBits::eTransferWrite, vk::AccessFlagBits::eHostRead,
+                VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+                visibleCountReadbackBuffer.getBuffer(), 0, sizeof(uint32_t));
+            commandBuffer->pipelineBarrier(
+                vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+                vk::DependencyFlags(), 0, nullptr, 1, &visibleCountHostBarrier, 0, nullptr);
+
+            vk::ImageMemoryBarrier transferToColorBarrier(
                 vk::AccessFlagBits::eTransferWrite,
-                vk::AccessFlagBits::eNone,
+                vk::AccessFlagBits::eColorAttachmentRead | vk::AccessFlagBits::eColorAttachmentWrite,
                 vk::ImageLayout::eTransferDstOptimal,
-                vk::ImageLayout::ePresentSrcKHR,
+                vk::ImageLayout::eColorAttachmentOptimal,
                 VK_QUEUE_FAMILY_IGNORED,
                 VK_QUEUE_FAMILY_IGNORED,
                 swapchainImages[imageIndex],
                 vk::ImageSubresourceRange(vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1));
             commandBuffer->pipelineBarrier(
-                vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eBottomOfPipe,
-                vk::DependencyFlags(), 0, nullptr, 0, nullptr, 1, &toPresentSrc);
+                vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eColorAttachmentOutput,
+                vk::DependencyFlags(), 0, nullptr, 0, nullptr, 1, &transferToColorBarrier);
+
+            vk::RenderPassBeginInfo imguiBeginInfo(
+                *imguiRenderPass,
+                *imguiFramebuffers[imageIndex],
+                vk::Rect2D(vk::Offset2D(0, 0), vk::Extent2D(WIDTH, HEIGHT)),
+                0, nullptr);
+            commandBuffer->beginRenderPass(imguiBeginInfo, vk::SubpassContents::eInline);
+            ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), static_cast<VkCommandBuffer>(*commandBuffer));
+            commandBuffer->endRenderPass();
 
             nvtxRangePop();
 
@@ -1758,7 +1862,7 @@ int main() {
 
             // Single submit: wait on imageAvailableSemaphore, signal renderFinishedSemaphore + renderFence
             vk::Semaphore waitSemaphores[] = {*imageAvailableSemaphores[currentFrame]};
-            vk::PipelineStageFlags waitStages[] = {vk::PipelineStageFlagBits::eTransfer};
+            vk::PipelineStageFlags waitStages[] = {vk::PipelineStageFlagBits::eTopOfPipe};
             vk::Semaphore signalSemaphores[] = {*renderFinishedSemaphores[currentFrame]};
 
             vk::SubmitInfo submitInfo(
@@ -1784,10 +1888,16 @@ int main() {
             }
 
             currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
+            isFirstFrame = false;
         }
 
         std::cout << "[System] Render loop exited. Shutting down..." << std::endl;
-        vulkanDevice.getDevice().waitIdle();
+        VK_CHECK(vulkanDevice.getDevice().waitIdle());
+        visibleCountReadbackBuffer.unmap();
+        cameraBuffer.unmap();
+        ImGui_ImplVulkan_Shutdown();
+        ImGui_ImplGlfw_Shutdown();
+        ImGui::DestroyContext();
 
         // ============================================================
         // Phase 13: Reverse DMA - Readback touchedTilesBuffer to CPU
