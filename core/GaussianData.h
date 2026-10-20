@@ -12,7 +12,7 @@ struct alignas(16) GaussianPoint {
 };
 */
 
-struct GaussianPoint {
+struct alignas(16) GaussianPoint {
     float px, py, pz;     // 12 bytes
     float opacity;        // 4 bytes (Packed to 16 bytes)
     float sx, sy, sz;     // 12 bytes
@@ -22,7 +22,7 @@ struct GaussianPoint {
     float rw, rx, ry, rz; // 16 bytes
 }; // Total: 64 bytes
 
-static_assert(sizeof(GaussianPoint) == 48, "GaussianPoint must be exactly 48 bytes");
+static_assert(sizeof(GaussianPoint) == 64, "GaussianPoint must be exactly 64 bytes");
 static_assert(alignof(GaussianPoint) == 16, "GaussianPoint must have 16-byte alignment");
 
 struct alignas(8) SortKeyPair {
