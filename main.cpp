@@ -46,6 +46,41 @@ inline void nvtxRangePop() {}
 #include "utils/NpyParser.h"
 #include "core/Gaussian2D.h"
 
+static vk::UniquePipeline createComputePipeline(
+    vk::Device device,
+    vk::PipelineLayout pipelineLayout,
+    const std::string& shaderFilename,
+    const char* pipelineName
+) {
+    const std::string shaderPath = std::string(SHADER_DIR) + "/" + shaderFilename;
+    const auto shaderCode = FileIO::readFile(shaderPath);
+
+    vk::ShaderModuleCreateInfo shaderModuleCreateInfo(
+        vk::ShaderModuleCreateFlags(),
+        shaderCode.size(),
+        reinterpret_cast<const uint32_t*>(shaderCode.data())
+    );
+    auto shaderModule = device.createShaderModuleUnique(shaderModuleCreateInfo);
+
+    vk::PipelineShaderStageCreateInfo stageCreateInfo(
+        vk::PipelineShaderStageCreateFlags(),
+        vk::ShaderStageFlagBits::eCompute,
+        *shaderModule,
+        "main"
+    );
+    vk::ComputePipelineCreateInfo computePipelineCreateInfo(
+        vk::PipelineCreateFlags(),
+        stageCreateInfo,
+        pipelineLayout
+    );
+
+    auto pipelineResult = device.createComputePipelineUnique(nullptr, computePipelineCreateInfo);
+    if (pipelineResult.result != vk::Result::eSuccess) {
+        throw std::runtime_error(std::string("Fatal: Failed to create ") + pipelineName + " compute pipeline.");
+    }
+    return std::move(pipelineResult.value);
+}
+
 // Global function pointer table memory allocation
 VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE;
 
@@ -595,12 +630,7 @@ int main() {
         );
         auto imguiDescriptorPool = vulkanDevice.getDevice().createDescriptorPoolUnique(imguiPoolCI);
 
-        // ===== Compute Pipeline Setup =====
-
-        // 1. Read shader binary
-        std::string shaderPath = std::string(SHADER_DIR) + "/calc_depth.spv";
-        auto shaderCode = FileIO::readFile(shaderPath);
-        std::cout << "[System] Shader loaded: " << shaderCode.size() << " bytes." << std::endl;
+        // ===== GPU Resource and Pipeline Setup =====
 
         // 2. Parse Gaussian points
         std::string npyPath = std::string(SHADER_DIR) + "/test.npy";
@@ -874,14 +904,6 @@ int main() {
         std::cout << "[System] Tile pointers buffer created (" << tilePointersBufferSize
                   << " bytes, " << numTilesTotal << " tiles x uvec2)." << std::endl;
 
-        // 8. Shader module
-        vk::ShaderModuleCreateInfo shaderModuleCreateInfo(
-            vk::ShaderModuleCreateFlags(),
-            shaderCode.size(),
-            reinterpret_cast<const uint32_t*>(shaderCode.data())
-        );
-        auto shaderModule = vulkanDevice.getDevice().createShaderModuleUnique(shaderModuleCreateInfo);
-
         // 9. Descriptor set layout (15 bindings)
         // 0:  GaussianBuffer (SSBO)
         // 1:  SortKeyBuffer (SSBO, src for 32-bit radix)
@@ -958,244 +980,74 @@ int main() {
         auto pipelineLayout = vulkanDevice.getDevice().createPipelineLayoutUnique(pipelineLayoutCreateInfo);
 
         // 12a. calc_depth pipeline
-        vk::PipelineShaderStageCreateInfo stageCreateInfo(
-            vk::PipelineShaderStageCreateFlags(),
-            vk::ShaderStageFlagBits::eCompute,
-            *shaderModule,
-            "main"
-        );
-
-        vk::ComputePipelineCreateInfo computePipelineCreateInfo(
-            vk::PipelineCreateFlags(),
-            stageCreateInfo,
-            *pipelineLayout
-        );
-
-        auto computePipelineResult = vulkanDevice.getDevice().createComputePipelineUnique(nullptr, computePipelineCreateInfo);
-        if (computePipelineResult.result != vk::Result::eSuccess) {
-            throw std::runtime_error("Fatal: Failed to create compute pipeline.");
-        }
-        auto computePipeline = std::move(computePipelineResult.value);
+        auto computePipeline = createComputePipeline(
+            vulkanDevice.getDevice(), *pipelineLayout, "calc_depth.spv", "calc_depth");
 
         // 12b. radix_histogram pipeline (32-bit, reads SortKeyPair from binding 1)
-        std::string radixHistogramShaderPath = std::string(SHADER_DIR) + "/radix_histogram.spv";
-        auto radixHistogramShaderCode = FileIO::readFile(radixHistogramShaderPath);
-
-        vk::ShaderModuleCreateInfo radixHistogramSMCI(vk::ShaderModuleCreateFlags(), radixHistogramShaderCode.size(),
-            reinterpret_cast<const uint32_t*>(radixHistogramShaderCode.data()));
-        auto radixHistogramShaderModule = vulkanDevice.getDevice().createShaderModuleUnique(radixHistogramSMCI);
-
-        vk::PipelineShaderStageCreateInfo radixHistogramStageCI(
-            vk::PipelineShaderStageCreateFlags(), vk::ShaderStageFlagBits::eCompute, *radixHistogramShaderModule, "main");
-        vk::ComputePipelineCreateInfo radixHistogramPipelineCI(vk::PipelineCreateFlags(), radixHistogramStageCI, *pipelineLayout);
-
-        auto radixHistogramPipelineResult = vulkanDevice.getDevice().createComputePipelineUnique(nullptr, radixHistogramPipelineCI);
-        if (radixHistogramPipelineResult.result != vk::Result::eSuccess) {
-            throw std::runtime_error("Fatal: Failed to create radix histogram compute pipeline.");
-        }
-        auto radixHistogramPipeline = std::move(radixHistogramPipelineResult.value);
+        auto radixHistogramPipeline = createComputePipeline(
+            vulkanDevice.getDevice(), *pipelineLayout, "radix_histogram.spv", "radix_histogram");
         std::cout << "[System] Radix histogram pipeline created." << std::endl;
 
         // 12c. radix_scan pipeline (32-bit, reads histogram from binding 6, writes offsets to binding 7)
-        std::string radixScanShaderPath = std::string(SHADER_DIR) + "/radix_scan.spv";
-        auto radixScanShaderCode = FileIO::readFile(radixScanShaderPath);
-
-        vk::ShaderModuleCreateInfo radixScanSMCI(vk::ShaderModuleCreateFlags(), radixScanShaderCode.size(),
-            reinterpret_cast<const uint32_t*>(radixScanShaderCode.data()));
-        auto radixScanShaderModule = vulkanDevice.getDevice().createShaderModuleUnique(radixScanSMCI);
-
-        vk::PipelineShaderStageCreateInfo radixScanStageCI(
-            vk::PipelineShaderStageCreateFlags(), vk::ShaderStageFlagBits::eCompute, *radixScanShaderModule, "main");
-        vk::ComputePipelineCreateInfo radixScanPipelineCI(vk::PipelineCreateFlags(), radixScanStageCI, *pipelineLayout);
-
-        auto radixScanPipelineResult = vulkanDevice.getDevice().createComputePipelineUnique(nullptr, radixScanPipelineCI);
-        if (radixScanPipelineResult.result != vk::Result::eSuccess) {
-            throw std::runtime_error("Fatal: Failed to create radix scan compute pipeline.");
-        }
-        auto radixScanPipeline = std::move(radixScanPipelineResult.value);
+        auto radixScanPipeline = createComputePipeline(
+            vulkanDevice.getDevice(), *pipelineLayout, "radix_scan.spv", "radix_scan");
         std::cout << "[System] Radix scan pipeline created." << std::endl;
 
         // 12d. radix_scatter pipeline (32-bit, reads SortKeyPair from binding 1, writes to binding 5)
-        std::string radixScatterShaderPath = std::string(SHADER_DIR) + "/radix_scatter.spv";
-        auto radixScatterShaderCode = FileIO::readFile(radixScatterShaderPath);
-
-        vk::ShaderModuleCreateInfo radixScatterSMCI(vk::ShaderModuleCreateFlags(), radixScatterShaderCode.size(),
-            reinterpret_cast<const uint32_t*>(radixScatterShaderCode.data()));
-        auto radixScatterShaderModule = vulkanDevice.getDevice().createShaderModuleUnique(radixScatterSMCI);
-
-        vk::PipelineShaderStageCreateInfo radixScatterStageCI(
-            vk::PipelineShaderStageCreateFlags(), vk::ShaderStageFlagBits::eCompute, *radixScatterShaderModule, "main");
-        vk::ComputePipelineCreateInfo radixScatterPipelineCI(vk::PipelineCreateFlags(), radixScatterStageCI, *pipelineLayout);
-
-        auto radixScatterPipelineResult = vulkanDevice.getDevice().createComputePipelineUnique(nullptr, radixScatterPipelineCI);
-        if (radixScatterPipelineResult.result != vk::Result::eSuccess) {
-            throw std::runtime_error("Fatal: Failed to create radix scatter compute pipeline.");
-        }
-        auto radixScatterPipeline = std::move(radixScatterPipelineResult.value);
+        auto radixScatterPipeline = createComputePipeline(
+            vulkanDevice.getDevice(), *pipelineLayout, "radix_scatter.spv", "radix_scatter");
         std::cout << "[System] Radix scatter pipeline created." << std::endl;
 
         // 12e. preprocess pipeline
-        std::string preprocessShaderPath = std::string(SHADER_DIR) + "/preprocess.spv";
-        auto preprocessShaderCode = FileIO::readFile(preprocessShaderPath);
-
-        vk::ShaderModuleCreateInfo preprocessSMCI(vk::ShaderModuleCreateFlags(), preprocessShaderCode.size(),
-            reinterpret_cast<const uint32_t*>(preprocessShaderCode.data()));
-        auto preprocessShaderModule = vulkanDevice.getDevice().createShaderModuleUnique(preprocessSMCI);
-
-        vk::PipelineShaderStageCreateInfo preprocessStageCI(
-            vk::PipelineShaderStageCreateFlags(), vk::ShaderStageFlagBits::eCompute, *preprocessShaderModule, "main");
-        vk::ComputePipelineCreateInfo preprocessPipelineCI(vk::PipelineCreateFlags(), preprocessStageCI, *pipelineLayout);
-
-        auto preprocessPipelineResult = vulkanDevice.getDevice().createComputePipelineUnique(nullptr, preprocessPipelineCI);
-        if (preprocessPipelineResult.result != vk::Result::eSuccess) {
-            throw std::runtime_error("Fatal: Failed to create preprocess compute pipeline.");
-        }
-        auto preprocessPipeline = std::move(preprocessPipelineResult.value);
+        auto preprocessPipeline = createComputePipeline(
+            vulkanDevice.getDevice(), *pipelineLayout, "preprocess.spv", "preprocess");
         std::cout << "[System] Preprocess pipeline created." << std::endl;
 
         // 12f. rasterize pipeline
-        std::string rasterizeShaderPath = std::string(SHADER_DIR) + "/rasterize.spv";
-        auto rasterizeShaderCode = FileIO::readFile(rasterizeShaderPath);
-
-        vk::ShaderModuleCreateInfo rasterizeSMCI(vk::ShaderModuleCreateFlags(), rasterizeShaderCode.size(),
-            reinterpret_cast<const uint32_t*>(rasterizeShaderCode.data()));
-        auto rasterizeShaderModule = vulkanDevice.getDevice().createShaderModuleUnique(rasterizeSMCI);
-
-        vk::PipelineShaderStageCreateInfo rasterizeStageCI(
-            vk::PipelineShaderStageCreateFlags(), vk::ShaderStageFlagBits::eCompute, *rasterizeShaderModule, "main");
-        vk::ComputePipelineCreateInfo rasterizePipelineCI(vk::PipelineCreateFlags(), rasterizeStageCI, *pipelineLayout);
-
-        auto rasterizePipelineResult = vulkanDevice.getDevice().createComputePipelineUnique(nullptr, rasterizePipelineCI);
-        if (rasterizePipelineResult.result != vk::Result::eSuccess) {
-            throw std::runtime_error("Fatal: Failed to create rasterize compute pipeline.");
-        }
-        auto rasterizePipeline = std::move(rasterizePipelineResult.value);
+        auto rasterizePipeline = createComputePipeline(
+            vulkanDevice.getDevice(), *pipelineLayout, "rasterize.spv", "rasterize");
         std::cout << "[System] Rasterize pipeline created." << std::endl;
 
         // ============================================================
         // Phase 15: tile_scan pipeline
         // ============================================================
-        std::string tileScanShaderPath = std::string(SHADER_DIR) + "/tile_scan.spv";
-        auto tileScanShaderCode = FileIO::readFile(tileScanShaderPath);
-
-        vk::ShaderModuleCreateInfo tileScanSMCI(vk::ShaderModuleCreateFlags(), tileScanShaderCode.size(),
-            reinterpret_cast<const uint32_t*>(tileScanShaderCode.data()));
-        auto tileScanShaderModule = vulkanDevice.getDevice().createShaderModuleUnique(tileScanSMCI);
-
-        vk::PipelineShaderStageCreateInfo tileScanStageCI(
-            vk::PipelineShaderStageCreateFlags(), vk::ShaderStageFlagBits::eCompute, *tileScanShaderModule, "main");
-        vk::ComputePipelineCreateInfo tileScanPipelineCI(vk::PipelineCreateFlags(), tileScanStageCI, *pipelineLayout);
-
-        auto tileScanPipelineResult = vulkanDevice.getDevice().createComputePipelineUnique(nullptr, tileScanPipelineCI);
-        if (tileScanPipelineResult.result != vk::Result::eSuccess) {
-            throw std::runtime_error("Fatal: Failed to create tile_scan compute pipeline.");
-        }
-        auto tileScanPipeline = std::move(tileScanPipelineResult.value);
+        auto tileScanPipeline = createComputePipeline(
+            vulkanDevice.getDevice(), *pipelineLayout, "tile_scan.spv", "tile_scan");
         std::cout << "[System] Tile scan pipeline created." << std::endl;
 
         // ============================================================
         // Phase 15: tile_duplicate pipeline
         // ============================================================
-        std::string tileDuplicateShaderPath = std::string(SHADER_DIR) + "/tile_duplicate.spv";
-        auto tileDuplicateShaderCode = FileIO::readFile(tileDuplicateShaderPath);
-
-        vk::ShaderModuleCreateInfo tileDuplicateSMCI(vk::ShaderModuleCreateFlags(), tileDuplicateShaderCode.size(),
-            reinterpret_cast<const uint32_t*>(tileDuplicateShaderCode.data()));
-        auto tileDuplicateShaderModule = vulkanDevice.getDevice().createShaderModuleUnique(tileDuplicateSMCI);
-
-        vk::PipelineShaderStageCreateInfo tileDuplicateStageCI(
-            vk::PipelineShaderStageCreateFlags(), vk::ShaderStageFlagBits::eCompute, *tileDuplicateShaderModule, "main");
-        vk::ComputePipelineCreateInfo tileDuplicatePipelineCI(vk::PipelineCreateFlags(), tileDuplicateStageCI, *pipelineLayout);
-
-        auto tileDuplicatePipelineResult = vulkanDevice.getDevice().createComputePipelineUnique(nullptr, tileDuplicatePipelineCI);
-        if (tileDuplicatePipelineResult.result != vk::Result::eSuccess) {
-            throw std::runtime_error("Fatal: Failed to create tile_duplicate compute pipeline.");
-        }
-        auto tileDuplicatePipeline = std::move(tileDuplicatePipelineResult.value);
+        auto tileDuplicatePipeline = createComputePipeline(
+            vulkanDevice.getDevice(), *pipelineLayout, "tile_duplicate.spv", "tile_duplicate");
         std::cout << "[System] Tile duplicate pipeline created." << std::endl;
 
         // ============================================================
         // Phase 15: tile_radix_histogram pipeline (64-bit, reads TileSortKeyPair from binding 10)
         // ============================================================
-        std::string tileRadixHistogramShaderPath = std::string(SHADER_DIR) + "/tile_radix_histogram.spv";
-        auto tileRadixHistogramShaderCode = FileIO::readFile(tileRadixHistogramShaderPath);
-
-        vk::ShaderModuleCreateInfo tileRadixHistogramSMCI(vk::ShaderModuleCreateFlags(), tileRadixHistogramShaderCode.size(),
-            reinterpret_cast<const uint32_t*>(tileRadixHistogramShaderCode.data()));
-        auto tileRadixHistogramShaderModule = vulkanDevice.getDevice().createShaderModuleUnique(tileRadixHistogramSMCI);
-
-        vk::PipelineShaderStageCreateInfo tileRadixHistogramStageCI(
-            vk::PipelineShaderStageCreateFlags(), vk::ShaderStageFlagBits::eCompute, *tileRadixHistogramShaderModule, "main");
-        vk::ComputePipelineCreateInfo tileRadixHistogramPipelineCI(vk::PipelineCreateFlags(), tileRadixHistogramStageCI, *pipelineLayout);
-
-        auto tileRadixHistogramPipelineResult = vulkanDevice.getDevice().createComputePipelineUnique(nullptr, tileRadixHistogramPipelineCI);
-        if (tileRadixHistogramPipelineResult.result != vk::Result::eSuccess) {
-            throw std::runtime_error("Fatal: Failed to create tile_radix_histogram compute pipeline.");
-        }
-        auto tileRadixHistogramPipeline = std::move(tileRadixHistogramPipelineResult.value);
+        auto tileRadixHistogramPipeline = createComputePipeline(
+            vulkanDevice.getDevice(), *pipelineLayout, "tile_radix_histogram.spv", "tile_radix_histogram");
         std::cout << "[System] Tile radix histogram pipeline created." << std::endl;
 
         // ============================================================
         // Phase 15: tile_radix_scan pipeline (64-bit, reads histogram from binding 12)
         // ============================================================
-        std::string tileRadixScanShaderPath = std::string(SHADER_DIR) + "/tile_radix_scan.spv";
-        auto tileRadixScanShaderCode = FileIO::readFile(tileRadixScanShaderPath);
-
-        vk::ShaderModuleCreateInfo tileRadixScanSMCI(vk::ShaderModuleCreateFlags(), tileRadixScanShaderCode.size(),
-            reinterpret_cast<const uint32_t*>(tileRadixScanShaderCode.data()));
-        auto tileRadixScanShaderModule = vulkanDevice.getDevice().createShaderModuleUnique(tileRadixScanSMCI);
-
-        vk::PipelineShaderStageCreateInfo tileRadixScanStageCI(
-            vk::PipelineShaderStageCreateFlags(), vk::ShaderStageFlagBits::eCompute, *tileRadixScanShaderModule, "main");
-        vk::ComputePipelineCreateInfo tileRadixScanPipelineCI(vk::PipelineCreateFlags(), tileRadixScanStageCI, *pipelineLayout);
-
-        auto tileRadixScanPipelineResult = vulkanDevice.getDevice().createComputePipelineUnique(nullptr, tileRadixScanPipelineCI);
-        if (tileRadixScanPipelineResult.result != vk::Result::eSuccess) {
-            throw std::runtime_error("Fatal: Failed to create tile_radix_scan compute pipeline.");
-        }
-        auto tileRadixScanPipeline = std::move(tileRadixScanPipelineResult.value);
+        auto tileRadixScanPipeline = createComputePipeline(
+            vulkanDevice.getDevice(), *pipelineLayout, "tile_radix_scan.spv", "tile_radix_scan");
         std::cout << "[System] Tile radix scan pipeline created." << std::endl;
 
         // ============================================================
         // Phase 15: tile_radix_scatter pipeline (64-bit, reads TileSortKeyPair from binding 10, writes to binding 11)
         // ============================================================
-        std::string tileRadixScatterShaderPath = std::string(SHADER_DIR) + "/tile_radix_scatter.spv";
-        auto tileRadixScatterShaderCode = FileIO::readFile(tileRadixScatterShaderPath);
-
-        vk::ShaderModuleCreateInfo tileRadixScatterSMCI(vk::ShaderModuleCreateFlags(), tileRadixScatterShaderCode.size(),
-            reinterpret_cast<const uint32_t*>(tileRadixScatterShaderCode.data()));
-        auto tileRadixScatterShaderModule = vulkanDevice.getDevice().createShaderModuleUnique(tileRadixScatterSMCI);
-
-        vk::PipelineShaderStageCreateInfo tileRadixScatterStageCI(
-            vk::PipelineShaderStageCreateFlags(), vk::ShaderStageFlagBits::eCompute, *tileRadixScatterShaderModule, "main");
-        vk::ComputePipelineCreateInfo tileRadixScatterPipelineCI(vk::PipelineCreateFlags(), tileRadixScatterStageCI, *pipelineLayout);
-
-        auto tileRadixScatterPipelineResult = vulkanDevice.getDevice().createComputePipelineUnique(nullptr, tileRadixScatterPipelineCI);
-        if (tileRadixScatterPipelineResult.result != vk::Result::eSuccess) {
-            throw std::runtime_error("Fatal: Failed to create tile_radix_scatter compute pipeline.");
-        }
-        auto tileRadixScatterPipeline = std::move(tileRadixScatterPipelineResult.value);
+        auto tileRadixScatterPipeline = createComputePipeline(
+            vulkanDevice.getDevice(), *pipelineLayout, "tile_radix_scatter.spv", "tile_radix_scatter");
         std::cout << "[System] Tile radix scatter pipeline created." << std::endl;
 
         // ============================================================
         // Phase 16: tile_pointers pipeline
         // ============================================================
-        std::string tilePointersShaderPath = std::string(SHADER_DIR) + "/tile_pointers.spv";
-        auto tilePointersShaderCode = FileIO::readFile(tilePointersShaderPath);
-
-        vk::ShaderModuleCreateInfo tilePointersSMCI(vk::ShaderModuleCreateFlags(), tilePointersShaderCode.size(),
-            reinterpret_cast<const uint32_t*>(tilePointersShaderCode.data()));
-        auto tilePointersShaderModule = vulkanDevice.getDevice().createShaderModuleUnique(tilePointersSMCI);
-
-        vk::PipelineShaderStageCreateInfo tilePointersStageCI(
-            vk::PipelineShaderStageCreateFlags(), vk::ShaderStageFlagBits::eCompute, *tilePointersShaderModule, "main");
-        vk::ComputePipelineCreateInfo tilePointersPipelineCI(vk::PipelineCreateFlags(), tilePointersStageCI, *pipelineLayout);
-
-        auto tilePointersPipelineResult = vulkanDevice.getDevice().createComputePipelineUnique(nullptr, tilePointersPipelineCI);
-        if (tilePointersPipelineResult.result != vk::Result::eSuccess) {
-            throw std::runtime_error("Fatal: Failed to create tile_pointers compute pipeline.");
-        }
-        auto tilePointersPipeline = std::move(tilePointersPipelineResult.value);
+        auto tilePointersPipeline = createComputePipeline(
+            vulkanDevice.getDevice(), *pipelineLayout, "tile_pointers.spv", "tile_pointers");
         std::cout << "[System] Tile pointers pipeline created." << std::endl;
 
         // 13. Descriptor sets (3 sets: mainDS + swapDS + tileSwapDS)
